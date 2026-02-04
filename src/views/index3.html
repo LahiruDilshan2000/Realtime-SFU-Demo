@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script
+      src="https://cdnjs.cloudflare.com/ajax/libs/webrtc-adapter/8.1.2/adapter.min.js"
+      integrity="sha512-l40eBFtXx+ve5RryIELC3y6/OM6Nu89mLGQd7fg1C93tN6XrkC3supb+/YiD/Y+B8P37kdJjtG1MT1kOO2VzxA=="
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    ></script>
+  </head>
+
+  <body>
+    <div class="grid">
+      <h1>Video Call — User 1 (Sender)</h1>
+      <div>
+        <h2>Local stream</h2>
+        <video id="local" muted autoplay playsinline></video>
+        <p class="hint">Open index4 in another tab to receive this stream.</p>
+      </div>
+    </div>
+
+    <script type="module">
+      const API_BASE = "http://localhost:8092";
+      const ROOM_TOKEN = "pmZYT4i4";
+
+      const USER_1_TOKEN = await signIn("dilshangames@gmail.com", "123456");
+
+      function getHeader(TOKEN) {
+        return {
+          Authorization: `Bearer ${TOKEN}`,
+          "Content-Type": "application/json",
+        };
+      }
+
+      const localVideo = document.querySelector("video#local");
+      if (!(localVideo instanceof HTMLVideoElement))
+        throw new Error("video#local should be a video element");
+
+      const media = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: true,
+      });
+      localVideo.srcObject = media;
+
+      const localSessionId = await createCallsSession(USER_1_TOKEN);
+      const localPeerConnection = await createPeerConnection();
+
+      const transceivers = media.getTracks().map((track) =>
+        localPeerConnection.addTransceiver(track, { direction: "sendonly" })
+      );
+
+      const localOffer = await localPeerConnection.createOffer();
+      await localPeerConnection.setLocalDescription(localOffer);
+
+      const pushTracksResponse = await fetch(
+        `${API_BASE}/share-nest/api/v1/talk/sessions/${localSessionId}/tracks/publish`,
+        {
+          method: "POST",
+          headers: getHeader(USER_1_TOKEN),
+          body: JSON.stringify({
+            sessionDescription: {
+              sdp: localOffer.sdp,
+              type: "offer",
+            },
+            tracks: transceivers.map(({ mid, sender }) => ({
+              location: "local",
+              mid,
+              kind: sender.track?.kind,
+              trackName: sender.track?.id,
+            })),
+          }),
+        }
+      ).then((res) => res.json());
+      console.log("publish track (User 1) — sessionId:", localSessionId);
+      console.log(pushTracksResponse.data?.sessionDescription);
+
+      const connected = new Promise((res, rej) => {
+        setTimeout(rej, 5000);
+        const iceConnectionStateChangeHandler = () => {
+          if (localPeerConnection.iceConnectionState === "connected") {
+            localPeerConnection.removeEventListener(
+              "iceconnectionstatechange",
+              iceConnectionStateChangeHandler
+            );
+            res(undefined);
+          }
+        };
+        localPeerConnection.addEventListener(
+          "iceconnectionstatechange",
+          iceConnectionStateChangeHandler
+        );
+      });
+
+      await localPeerConnection.setRemoteDescription(
+        new RTCSessionDescription(pushTracksResponse.data.sessionDescription)
+      );
+      await connected;
+
+      // ===================================================================
+      // User 1 is now sending to Calls. Backend has session + track info.
+      // User 2 (index4) can fetch room info and subscribe to these tracks.
+      // ===================================================================
+      console.log("User 1 sending. SessionId:", localSessionId);
+
+      async function createCallsSession(TOKEN) {
+        const sessionResponse = await fetch(
+          `${API_BASE}/share-nest/api/v1/talk/rooms/${ROOM_TOKEN}/join`,
+          {
+            method: "POST",
+            headers: getHeader(TOKEN),
+            body: JSON.stringify({
+              mediaConstraints: { video: true, audio: true },
+            }),
+          }
+        ).then((res) => res.json());
+        console.log("create Session —", sessionResponse.data?.sessionId);
+        return sessionResponse.data.sessionId;
+      }
+
+      async function signIn(username, password) {
+        const authResponse = await fetch(
+          `${API_BASE}/share-nest/api/v1/auth/signin`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "USER-DOMAIN": "sharenest.io",
+            },
+            body: JSON.stringify({ username, password }),
+          }
+        ).then((res) => res.json());
+        console.log("sign In —", authResponse.token ? "ok" : authResponse);
+        return authResponse.token;
+      }
+
+      async function createPeerConnection() {
+        return new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }],
+          bundlePolicy: "max-bundle",
+        });
+      }
+    </script>
+    <style>
+      html { color-scheme: light dark; font-family: system-ui, sans-serif; background: #1a1a1a; color: #eee; }
+      body, h1, h2 { margin: 0; }
+      h1 { font-size: 1.5rem; grid-column: 1 / -1; }
+      h2 { font-size: 1rem; margin-bottom: 0.5rem; }
+      .hint { font-size: 0.875rem; color: #888; margin-top: 0.5rem; }
+      video { width: 100%; }
+      .grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; padding: 1rem; }
+    </style>
+  </body>
+</html>
