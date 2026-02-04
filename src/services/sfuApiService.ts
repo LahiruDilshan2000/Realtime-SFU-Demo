@@ -221,7 +221,11 @@ class SFUApiService {
     }
 
     // 13. Leave Chat by Session (session-based; requires tracks + sessionDescription)
-    async leaveChatSession(sessionId: string, request: LeaveChatRequest): Promise<ApiResponse> {
+    async leaveChatSession(sessionId: string, request: {
+        sessionDescription: { type: string; sdp: string };
+        force: boolean;
+        tracks: { mid: string }[]
+    }): Promise<ApiResponse> {
         const response = await this.api.post<ApiResponse>(
             `/sessions/${sessionId}/leave-chat`,
             request

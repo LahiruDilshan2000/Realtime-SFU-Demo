@@ -7,7 +7,7 @@
 import {useRef, useState, useEffect} from 'react';
 import {API_CONFIG} from '../constants/api';
 import sfuApiService from '../services/sfuApiService';
-import type {RoomInfoResponse, EstablishDataChannelsResponse} from '../types/sfu';
+import type {RoomInfoResponse, EstablishDataChannelsResponse, EstablishDataChannelsRequest} from '../types/sfu';
 
 const API_BASE = API_CONFIG.BASE_URL;
 const AUTH_BASE = API_CONFIG.BASE_URL_AUTH;
@@ -15,6 +15,7 @@ const ROOM_ID = 'pmZYT4i4';
 const STORAGE_KEY = API_CONFIG.STORAGE_TOKEN_KEY;
 const ROOM_POLL_INTERVAL_MS = 8000;
 const MUTE_DATA_CHANNEL_NAME = 'mute-signal';
+const CHAT_DATA_CHANNEL_NAME = 'chat';
 
 function getHeader(token: string) {
     return {
@@ -103,13 +104,18 @@ export default function VideoCall() {
     const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const localStreamRef = useRef<MediaStream | null>(null);
     const muteDataChannelRef = useRef<RTCDataChannel | null>(null);
+    const chatDataChannelRef = useRef<RTCDataChannel | null>(null);
     const remotePeerConnectionRef = useRef<RTCPeerConnection | null>(null);
     const mutedRef = useRef(false);
+    const chatMessagesEndRef = useRef<HTMLDivElement>(null);
 
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
     const [muted, setMuted] = useState(false);
     const [remoteMuted, setRemoteMuted] = useState(false);
+    const [chatOpen, setChatOpen] = useState(false);
+    const [chatMessages, setChatMessages] = useState<Array<{id: string; text: string; sender: 'me' | 'other'; timestamp: number}>>([]);
+    const [chatInput, setChatInput] = useState('');
 
     async function handleLogin(e: React.FormEvent) {
         e.preventDefault();
@@ -141,8 +147,11 @@ export default function VideoCall() {
         remoteSubscribedSessionIdRef.current = null;
         localStreamRef.current = null;
         muteDataChannelRef.current = null;
+        chatDataChannelRef.current = null;
         remotePeerConnectionRef.current = null;
         setRemoteMuted(false);
+        setChatMessages([]);
+        setChatInput('');
         const localVideo = localVideoRef.current;
         const remoteVideo = remoteVideoRef.current;
         if (localVideo?.srcObject) {
@@ -192,6 +201,7 @@ export default function VideoCall() {
                 };
             } else {
                 const offer = await pc.createOffer();
+                // @ts-ignore
                 sessionDescription = {type: offer.type, sdp: offer.sdp};
             }
 
@@ -233,7 +243,10 @@ export default function VideoCall() {
         setMuted(false);
         setRemoteMuted(false);
         muteDataChannelRef.current = null;
+        chatDataChannelRef.current = null;
         remotePeerConnectionRef.current = null;
+        setChatMessages([]);
+        setChatInput('');
         try {
             await sfuApiService.leaveRoom(ROOM_ID);
         } catch (e) {
@@ -293,6 +306,47 @@ export default function VideoCall() {
                 dc.send(JSON.stringify({muted: mutedRef.current}));
             } catch (_) {}
         };
+    }
+
+    async function establishAndPublishChatDataChannel(
+        pc: RTCPeerConnection,
+        sessionId: string
+    ) {
+        const response = await sfuApiService.publishDataChannels(sessionId, {
+            dataChannels: [{location: 'local', dataChannelName: CHAT_DATA_CHANNEL_NAME}],
+        });
+        const channelId = response.data?.dataChannels?.[0]?.id;
+        if (channelId == null) throw new Error('No chat data channel ID returned');
+        const dc = pc.createDataChannel(CHAT_DATA_CHANNEL_NAME, {
+            negotiated: true,
+            id: channelId,
+        });
+        chatDataChannelRef.current = dc;
+    }
+
+    function handleSendChatMessage() {
+        if (!chatInput.trim() || !chatDataChannelRef.current) return;
+        const message = chatInput.trim();
+        const messageData = {
+            type: 'chat',
+            text: message,
+            timestamp: Date.now(),
+        };
+        try {
+            chatDataChannelRef.current.send(JSON.stringify(messageData));
+            setChatMessages((prev) => [
+                ...prev,
+                {
+                    id: `msg-${Date.now()}-${Math.random()}`,
+                    text: message,
+                    sender: 'me',
+                    timestamp: Date.now(),
+                },
+            ]);
+            setChatInput('');
+        } catch (e) {
+            console.warn('Send chat message:', e);
+        }
     }
 
     async function doRemoteUserFlow(
@@ -374,7 +428,7 @@ export default function VideoCall() {
         remoteVideo.srcObject = remoteVideoStream;
         pulledTracks.forEach((t) => remoteVideoStream.addTrack(t));
 
-        const dcResponse = await sfuApiService.subscribeDataChannels(mySessionId, {
+        const muteDcResponse = await sfuApiService.subscribeDataChannels(mySessionId, {
             dataChannels: [
                 {
                     location: 'remote',
@@ -383,16 +437,49 @@ export default function VideoCall() {
                 },
             ],
         });
-        const channelId = dcResponse.data?.dataChannels?.[0]?.id;
-        if (channelId != null) {
-            const dc = remotePeerConnection.createDataChannel(`${MUTE_DATA_CHANNEL_NAME}-subscribed`, {
+        const muteChannelId = muteDcResponse.data?.dataChannels?.[0]?.id;
+        if (muteChannelId != null) {
+            const muteDc = remotePeerConnection.createDataChannel(`${MUTE_DATA_CHANNEL_NAME}-subscribed`, {
                 negotiated: true,
-                id: channelId,
+                id: muteChannelId,
             });
-            dc.onmessage = (ev: MessageEvent) => {
+            muteDc.onmessage = (ev: MessageEvent) => {
                 try {
                     const {muted} = JSON.parse(ev.data as string) as { muted?: boolean };
                     if (typeof muted === 'boolean') setRemoteMuted(muted);
+                } catch (_) {}
+            };
+        }
+
+        const chatDcResponse = await sfuApiService.subscribeDataChannels(mySessionId, {
+            dataChannels: [
+                {
+                    location: 'remote',
+                    sessionId: otherSessionId,
+                    dataChannelName: CHAT_DATA_CHANNEL_NAME,
+                },
+            ],
+        });
+        const chatChannelId = chatDcResponse.data?.dataChannels?.[0]?.id;
+        if (chatChannelId != null) {
+            const chatDc = remotePeerConnection.createDataChannel(`${CHAT_DATA_CHANNEL_NAME}-subscribed`, {
+                negotiated: true,
+                id: chatChannelId,
+            });
+            chatDc.onmessage = (ev: MessageEvent) => {
+                try {
+                    const data = JSON.parse(ev.data as string) as { type?: string; text?: string; timestamp?: number };
+                    if (data.type === 'chat' && data.text) {
+                        setChatMessages((prev) => [
+                            ...prev,
+                            {
+                                id: `msg-${data.timestamp || Date.now()}-${Math.random()}`,
+                                text: data.text!,
+                                sender: 'other',
+                                timestamp: data.timestamp || Date.now(),
+                            },
+                        ]);
+                    }
                 } catch (_) {}
             };
         }
@@ -434,6 +521,23 @@ export default function VideoCall() {
                         try {
                             const {muted} = JSON.parse(ev.data as string) as { muted?: boolean };
                             if (typeof muted === 'boolean') setRemoteMuted(muted);
+                        } catch (_) {}
+                    };
+                } else if (ch.label === CHAT_DATA_CHANNEL_NAME || ch.label === `${CHAT_DATA_CHANNEL_NAME}-subscribed`) {
+                    ch.onmessage = (ev: MessageEvent) => {
+                        try {
+                            const data = JSON.parse(ev.data as string) as { type?: string; text?: string; timestamp?: number };
+                            if (data.type === 'chat' && data.text) {
+                                setChatMessages((prev) => [
+                                    ...prev,
+                                    {
+                                        id: `msg-${data.timestamp || Date.now()}-${Math.random()}`,
+                                        text: data.text!,
+                                        sender: 'other',
+                                        timestamp: data.timestamp || Date.now(),
+                                    },
+                                ]);
+                            }
                         } catch (_) {}
                     };
                 }
@@ -495,6 +599,11 @@ export default function VideoCall() {
                 mySessionId
             ).catch((e) => console.warn('Mute data channel setup:', e));
 
+            await establishAndPublishChatDataChannel(
+                localPeerConnection,
+                mySessionId
+            ).catch((e) => console.warn('Chat data channel setup:', e));
+
             setInCall(true);
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
@@ -502,6 +611,12 @@ export default function VideoCall() {
             setLoading(false);
         }
     }
+
+    useEffect(() => {
+        if (chatMessagesEndRef.current) {
+            chatMessagesEndRef.current.scrollIntoView({behavior: 'smooth'});
+        }
+    }, [chatMessages]);
 
     useEffect(() => {
         if (!inCall) return;
@@ -597,7 +712,7 @@ export default function VideoCall() {
                     Logout
                 </button>
             </div>
-            <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4 max-sm:grid-cols-1 px-4 flex-1">
+            <div className={`grid gap-4 px-4 flex-1 ${chatOpen ? 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)_320px] max-lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]' : 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)]'} max-sm:grid-cols-1`}>
                 <div>
                     <h2 className="text-base font-normal mb-2">Local stream</h2>
                     <video
@@ -633,8 +748,140 @@ export default function VideoCall() {
                         )}
                     </div>
                 </div>
+                {chatOpen && (
+                    <div className="max-lg:hidden flex flex-col bg-white/5 border border-white/10 rounded-lg h-[600px]">
+                        <div className="flex items-center justify-between p-3 border-b border-white/10">
+                            <h3 className="text-sm font-medium">Chat</h3>
+                            <button
+                                type="button"
+                                onClick={() => setChatOpen(false)}
+                                className="text-white/60 hover:text-white"
+                            >
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                </svg>
+                            </button>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-3 space-y-2">
+                            {chatMessages.length === 0 ? (
+                                <p className="text-white/40 text-sm text-center py-8">No messages yet</p>
+                            ) : (
+                                chatMessages.map((msg) => (
+                                    <div
+                                        key={msg.id}
+                                        className={`flex ${msg.sender === 'me' ? 'justify-end' : 'justify-start'}`}
+                                    >
+                                        <div
+                                            className={`max-w-[80%] rounded-lg px-3 py-2 ${
+                                                msg.sender === 'me'
+                                                    ? 'bg-green-600 text-white'
+                                                    : 'bg-white/10 text-white'
+                                            }`}
+                                        >
+                                            <p className="text-sm">{msg.text}</p>
+                                            <p className={`text-xs mt-1 ${msg.sender === 'me' ? 'text-green-100' : 'text-white/60'}`}>
+                                                {new Date(msg.timestamp).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}
+                                            </p>
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                            <div ref={chatMessagesEndRef} />
+                        </div>
+                        <div className="p-3 border-t border-white/10">
+                            <form
+                                onSubmit={(e) => {
+                                    e.preventDefault();
+                                    handleSendChatMessage();
+                                }}
+                                className="flex gap-2"
+                            >
+                                <input
+                                    type="text"
+                                    value={chatInput}
+                                    onChange={(e) => setChatInput(e.target.value)}
+                                    placeholder="Type a message..."
+                                    className="flex-1 bg-white/5 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-white/40 focus:outline-none focus:border-white/20"
+                                />
+                                <button
+                                    type="submit"
+                                    disabled={!chatInput.trim()}
+                                    className="px-4 py-2 bg-green-600 text-white rounded text-sm font-medium hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                                >
+                                    Send
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+                )}
             </div>
             {error && <p className="text-red-500 px-4 text-sm">{error}</p>}
+            {chatOpen && (
+                <div className="lg:hidden fixed inset-0 z-50 bg-black/90 flex flex-col">
+                    <div className="flex items-center justify-between p-4 border-b border-white/10">
+                        <h3 className="text-lg font-medium">Chat</h3>
+                        <button
+                            type="button"
+                            onClick={() => setChatOpen(false)}
+                            className="text-white/60 hover:text-white"
+                        >
+                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </div>
+                    <div className="flex-1 overflow-y-auto p-4 space-y-2">
+                        {chatMessages.length === 0 ? (
+                            <p className="text-white/40 text-sm text-center py-8">No messages yet</p>
+                        ) : (
+                            chatMessages.map((msg) => (
+                                <div
+                                    key={msg.id}
+                                    className={`flex ${msg.sender === 'me' ? 'justify-end' : 'justify-start'}`}
+                                >
+                                    <div
+                                        className={`max-w-[80%] rounded-lg px-3 py-2 ${
+                                            msg.sender === 'me'
+                                                ? 'bg-green-600 text-white'
+                                                : 'bg-white/10 text-white'
+                                        }`}
+                                    >
+                                        <p className="text-sm">{msg.text}</p>
+                                        <p className={`text-xs mt-1 ${msg.sender === 'me' ? 'text-green-100' : 'text-white/60'}`}>
+                                            {new Date(msg.timestamp).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}
+                                        </p>
+                                    </div>
+                                </div>
+                            ))
+                        )}
+                        <div ref={chatMessagesEndRef} />
+                    </div>
+                    <div className="p-4 border-t border-white/10">
+                        <form
+                            onSubmit={(e) => {
+                                e.preventDefault();
+                                handleSendChatMessage();
+                            }}
+                            className="flex gap-2"
+                        >
+                            <input
+                                type="text"
+                                value={chatInput}
+                                onChange={(e) => setChatInput(e.target.value)}
+                                placeholder="Type a message..."
+                                className="flex-1 bg-white/5 border border-white/10 rounded px-3 py-2 text-sm text-white placeholder-white/40 focus:outline-none focus:border-white/20"
+                            />
+                            <button
+                                type="submit"
+                                disabled={!chatInput.trim()}
+                                className="px-4 py-2 bg-green-600 text-white rounded text-sm font-medium hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                            >
+                                Send
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            )}
             <div className="flex justify-center items-center gap-2 py-4 px-4 shrink-0">
                 {!inCall ? (
                     <button
@@ -658,6 +905,17 @@ export default function VideoCall() {
                             title={muted ? 'Unmute' : 'Mute'}
                         >
                             {muted ? 'Unmute' : 'Mute'}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setChatOpen(!chatOpen)}
+                            className={`rounded-full px-4 py-2 text-sm font-medium border transition-colors ${
+                                chatOpen
+                                    ? 'bg-green-600/20 border-green-400/50 text-green-400'
+                                    : 'bg-white/5 border-white/10 hover:bg-white/10'
+                            }`}
+                        >
+                            Chat
                         </button>
                         <button
                             type="button"
