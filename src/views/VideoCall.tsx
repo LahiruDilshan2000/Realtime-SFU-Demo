@@ -3,6 +3,7 @@
  * "Join call" runs only local flow (get media, join room, publish).
  * Room info is polled every 5s; when another in-call user with sessionId and
  * audio/video track names is found, remote subscribe flow runs.
+ * Join/leave notifications are shown from both: polling (participant diff) and data channel.
  */
 import {useRef, useState, useEffect} from 'react';
 import {API_CONFIG} from '../constants/api';
@@ -116,6 +117,11 @@ export default function VideoCall() {
     const [chatOpen, setChatOpen] = useState(false);
     const [chatMessages, setChatMessages] = useState<Array<{id: string; text: string; sender: 'me' | 'other'; timestamp: number}>>([]);
     const [chatInput, setChatInput] = useState('');
+    const [notifications, setNotifications] = useState<Array<{id: string; message: string; type: 'join' | 'leave'; timestamp: number}>>([]);
+    const previousParticipantsRef = useRef<Set<string>>(new Set());
+    const joinNotificationReadyRef = useRef(false);
+    const chatDcOpenBeforeReadyRef = useRef(false);
+    const [remoteParticipantDisplayName, setRemoteParticipantDisplayName] = useState('');
 
     async function handleLogin(e: React.FormEvent) {
         e.preventDefault();
@@ -150,6 +156,7 @@ export default function VideoCall() {
         chatDataChannelRef.current = null;
         remotePeerConnectionRef.current = null;
         setRemoteMuted(false);
+        setRemoteParticipantDisplayName('');
         setChatMessages([]);
         setChatInput('');
         const localVideo = localVideoRef.current;
@@ -187,6 +194,8 @@ export default function VideoCall() {
         const sessionId = mySessionIdRef.current;
         const pc = peerConnectionRef.current;
         if (!sessionId || !pc) return;
+        sendNotificationEvent('leave');
+        await new Promise((r) => setTimeout(r, 300));
         try {
             const transceivers = pc.getTransceivers();
             const tracks = transceivers
@@ -213,9 +222,25 @@ export default function VideoCall() {
         } catch (e) {
             console.warn('Leave chat:', e);
         }
+        doLeaveCleanup();
+        try {
+            await sfuApiService.leaveRoom(ROOM_ID);
+        } catch (e) {
+            console.warn('Leave room:', e);
+        }
     }
 
     async function handleLeaveRoom() {
+        sendNotificationEvent('leave');
+        doLeaveCleanup();
+        try {
+            await sfuApiService.leaveRoom(ROOM_ID);
+        } catch (e) {
+            console.warn('Leave room:', e);
+        }
+    }
+
+    function doLeaveCleanup() {
         if (pollIntervalRef.current) {
             clearInterval(pollIntervalRef.current);
             pollIntervalRef.current = null;
@@ -247,11 +272,11 @@ export default function VideoCall() {
         remotePeerConnectionRef.current = null;
         setChatMessages([]);
         setChatInput('');
-        try {
-            await sfuApiService.leaveRoom(ROOM_ID);
-        } catch (e) {
-            console.warn('Leave room:', e);
-        }
+        previousParticipantsRef.current.clear();
+        joinNotificationReadyRef.current = false;
+        chatDcOpenBeforeReadyRef.current = false;
+        setNotifications([]);
+        setRemoteParticipantDisplayName('');
     }
 
     async function establishDataChannelTransport(
@@ -322,6 +347,44 @@ export default function VideoCall() {
             id: channelId,
         });
         chatDataChannelRef.current = dc;
+        dc.onopen = () => {
+            if (joinNotificationReadyRef.current) {
+                sendJoinNotificationWhenReady();
+            } else {
+                chatDcOpenBeforeReadyRef.current = true;
+            }
+        };
+    }
+
+    function showNotification(message: string, type: 'join' | 'leave') {
+        const id = `notif-${Date.now()}-${Math.random()}`;
+        setNotifications((prev) => [...prev, {id, message, type, timestamp: Date.now()}]);
+        setTimeout(() => {
+            setNotifications((prev) => prev.filter((n) => n.id !== id));
+        }, 5000);
+    }
+
+    function sendNotificationEvent(event: 'join' | 'leave', displayName?: string) {
+        const dc = chatDataChannelRef.current;
+        if (dc?.readyState === 'open') {
+            try {
+                const payload: Record<string, unknown> = {
+                    type: 'notification',
+                    event,
+                    timestamp: Date.now(),
+                };
+                if (displayName) payload.displayName = displayName;
+                dc.send(JSON.stringify(payload));
+            } catch (e) {
+                console.warn('Send notification event:', e);
+            }
+        }
+    }
+
+    function sendJoinNotificationWhenReady() {
+        const dc = chatDataChannelRef.current;
+        if (!dc || dc.readyState !== 'open') return;
+        sendNotificationEvent('join', 'User');
     }
 
     function handleSendChatMessage() {
@@ -468,7 +531,13 @@ export default function VideoCall() {
             });
             chatDc.onmessage = (ev: MessageEvent) => {
                 try {
-                    const data = JSON.parse(ev.data as string) as { type?: string; text?: string; timestamp?: number };
+                    const data = JSON.parse(ev.data as string) as {
+                        type?: string;
+                        text?: string;
+                        event?: 'join' | 'leave';
+                        timestamp?: number;
+                        displayName?: string;
+                    };
                     if (data.type === 'chat' && data.text) {
                         setChatMessages((prev) => [
                             ...prev,
@@ -479,6 +548,14 @@ export default function VideoCall() {
                                 timestamp: data.timestamp || Date.now(),
                             },
                         ]);
+                    } else if (data.type === 'notification' && data.event) {
+                        if (data.event === 'join') {
+                            const msg = data.displayName ? `${data.displayName} joined the call` : 'User joined the call';
+                            showNotification(msg, 'join');
+                        } else if (data.event === 'leave') {
+                            const msg = data.displayName ? `${data.displayName} left the call` : 'User left the call';
+                            showNotification(msg, 'leave');
+                        }
                     }
                 } catch (_) {}
             };
@@ -526,7 +603,13 @@ export default function VideoCall() {
                 } else if (ch.label === CHAT_DATA_CHANNEL_NAME || ch.label === `${CHAT_DATA_CHANNEL_NAME}-subscribed`) {
                     ch.onmessage = (ev: MessageEvent) => {
                         try {
-                            const data = JSON.parse(ev.data as string) as { type?: string; text?: string; timestamp?: number };
+                            const data = JSON.parse(ev.data as string) as {
+                                type?: string;
+                                text?: string;
+                                event?: 'join' | 'leave';
+                                timestamp?: number;
+                                displayName?: string;
+                            };
                             if (data.type === 'chat' && data.text) {
                                 setChatMessages((prev) => [
                                     ...prev,
@@ -537,6 +620,14 @@ export default function VideoCall() {
                                         timestamp: data.timestamp || Date.now(),
                                     },
                                 ]);
+                            } else if (data.type === 'notification' && data.event) {
+                                if (data.event === 'join') {
+                                    const msg = data.displayName ? `${data.displayName} joined the call` : 'User joined the call';
+                                    showNotification(msg, 'join');
+                                } else if (data.event === 'leave') {
+                                    const msg = data.displayName ? `${data.displayName} left the call` : 'User left the call';
+                                    showNotification(msg, 'leave');
+                                }
                             }
                         } catch (_) {}
                     };
@@ -604,6 +695,11 @@ export default function VideoCall() {
                 mySessionId
             ).catch((e) => console.warn('Chat data channel setup:', e));
 
+            joinNotificationReadyRef.current = true;
+            if (chatDcOpenBeforeReadyRef.current) {
+                await sendJoinNotificationWhenReady();
+            }
+
             setInCall(true);
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
@@ -636,11 +732,30 @@ export default function VideoCall() {
 
             try {
                 const roomInfo = await sfuApiService.getRoomInfo(ROOM_ID);
+                const currentParticipants = new Set(
+                    roomInfo.data?.participants
+                        ?.filter((p) => p.isInCall && p.sessionId)
+                        .map((p) => p.sessionId!) ?? []
+                );
+                const previousParticipants = previousParticipantsRef.current;
+                currentParticipants.forEach((sessionId) => {
+                    if (!previousParticipants.has(sessionId) && sessionId !== mySessionId) {
+                        showNotification('User joined the call', 'join');
+                    }
+                });
+                previousParticipants.forEach((sessionId) => {
+                    if (!currentParticipants.has(sessionId) && sessionId !== mySessionId) {
+                        showNotification('User left the call', 'leave');
+                    }
+                });
+                previousParticipantsRef.current = currentParticipants;
+
                 const other = findOtherInCallParticipant(roomInfo, mySessionId);
                 if (!other?.sessionId || !other.tracks) return;
                 if (remoteSubscribedSessionIdRef.current === other.sessionId) return;
 
                 remoteSubscribedSessionIdRef.current = other.sessionId;
+                setRemoteParticipantDisplayName(other.displayName ?? 'Remote');
                 await doRemoteUserFlow(
                     other.sessionId,
                     other.tracks,
@@ -701,7 +816,32 @@ export default function VideoCall() {
     }
 
     return (
-        <div className="flex flex-col min-h-screen">
+        <div className="flex flex-col min-h-screen relative">
+            <div className="absolute top-4 right-4 z-50 flex flex-col gap-2 pointer-events-none max-w-sm">
+                {notifications.map((notif) => (
+                    <div
+                        key={notif.id}
+                        className={`pointer-events-auto rounded-lg px-4 py-2.5 text-sm font-medium shadow-lg backdrop-blur-sm transition-all duration-300 ${
+                            notif.type === 'join'
+                                ? 'bg-green-600/95 text-white'
+                                : 'bg-gray-700/95 text-white'
+                        }`}
+                    >
+                        <div className="flex items-center gap-2">
+                            {notif.type === 'join' ? (
+                                <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" />
+                                </svg>
+                            ) : (
+                                <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                                </svg>
+                            )}
+                            <span>{notif.message}</span>
+                        </div>
+                    </div>
+                ))}
+            </div>
             <div className="flex justify-between items-center px-4 py-3 shrink-0">
                 <h1 className="text-xl font-normal">Video Call</h1>
                 <button
@@ -713,17 +853,22 @@ export default function VideoCall() {
                 </button>
             </div>
             <div className={`grid gap-4 px-4 flex-1 ${chatOpen ? 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)_320px] max-lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]' : 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)]'} max-sm:grid-cols-1`}>
-                <div>
+                <div className="relative">
                     <h2 className="text-base font-normal mb-2">Local stream</h2>
-                    <video
-                        ref={localVideoRef}
-                        autoPlay
-                        playsInline
-                        muted
-                        className="w-full bg-black rounded-lg"
-                    />
+                    <div className="relative w-full bg-black rounded-lg">
+                        <video
+                            ref={localVideoRef}
+                            autoPlay
+                            playsInline
+                            muted
+                            className="w-full bg-black rounded-lg"
+                        />
+                        <span className="absolute bottom-2 right-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">
+                            You
+                        </span>
+                    </div>
                 </div>
-                <div>
+                <div className="relative">
                     <h2 className="text-base font-normal mb-2">Remote stream</h2>
                     <div className="relative w-full bg-black rounded-lg">
                         <video
@@ -732,6 +877,9 @@ export default function VideoCall() {
                             playsInline
                             className="w-full rounded-lg"
                         />
+                        <span className="absolute bottom-2 right-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">
+                            {remoteParticipantDisplayName || 'Remote'}
+                        </span>
                         {remoteMuted && (
                             <div
                                 className="absolute inset-0 flex items-center justify-center bg-black/40 rounded-lg pointer-events-none"
