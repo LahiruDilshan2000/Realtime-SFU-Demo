@@ -1,20 +1,23 @@
+// Backend base URI (Java backend)
+const BACKEND_URI = 'http://localhost:8092';
+
 // Helper function to get the base URL dynamically
 // Uses relative URLs when accessed via ngrok (through Vite proxy)
-// Uses localhost URLs when accessed directly on localhost
+// Uses BACKEND_URI when accessed directly on localhost
 function getBaseUrl(): string {
   if (typeof window === 'undefined') {
-    return 'http://localhost:8092';
+    return BACKEND_URI;
   }
-  
+
   const hostname = window.location.hostname;
-  
-  // If accessing via localhost, use localhost URLs directly
+
+  // If accessing via localhost, use backend URI directly
   if (hostname === 'localhost' || hostname === '127.0.0.1') {
-    return 'http://localhost:8092';
+    return BACKEND_URI;
   }
-  
+
   // For ngrok or any other domain, use relative URLs
-  // Vite proxy will forward these to localhost:8092
+  // Vite proxy will forward these to the backend
   return '';
 }
 
@@ -42,6 +45,8 @@ function getWebSocketUrl(): string {
 
 // API Configuration Constants
 export const API_CONFIG = {
+  /** Backend base URI (e.g. http://localhost:8092) */
+  BACKEND_URI,
   BASE_URL: getBaseUrl() ? `${getBaseUrl()}/share-nest/api/v1/talk` : '/share-nest/api/v1/talk',
   BASE_URL_AUTH: getBaseUrl() ? `${getBaseUrl()}/share-nest/api/v1/auth` : '/share-nest/api/v1/auth',
   STORAGE_TOKEN_KEY: 'auth_token', // JWT token storage key

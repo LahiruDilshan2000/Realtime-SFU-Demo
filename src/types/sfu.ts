@@ -6,7 +6,7 @@ export interface MediaConstraints {
 }
 
 export interface SessionDescription {
-  sdp: string;
+  sdp: string | undefined;
   type: 'offer' | 'answer';
 }
 
@@ -39,6 +39,8 @@ export interface PublishTracksRequest {
   sessionDescription?: SessionDescription; // Optional - required for initial publish, optional for renegotiation
   tracks: TrackObject[];
   autoDiscover?: boolean;
+  /** Optional: publish data channels in the same offer (create DC before createOffer) */
+  dataChannels?: DataChannelObject[];
 }
 
 export interface PublishDataChannelsRequest {
@@ -51,6 +53,12 @@ export interface SubscribeTracksRequest {
     location: 'remote';
     sessionId: string; // Other user's session ID
     trackName: string; // Track name (audio or video)
+  }>;
+  /** Optional: subscribe to remote data channels in the same negotiation */
+  dataChannels?: Array<{
+    location: 'remote';
+    sessionId: string;
+    dataChannelName: string;
   }>;
 }
 
@@ -163,6 +171,19 @@ export interface PublishDataChannelsResponse {
   data: {
     dataChannels: DataChannelInfo[];
   };
+}
+
+export interface EstablishDataChannelsRequest {
+  dataChannel: {
+    location: 'remote';
+    dataChannelName: string;
+  };
+  sessionDescription?: SessionDescription;
+}
+
+export interface EstablishDataChannelsResponse {
+  requiresImmediateRenegotiation?: boolean;
+  sessionDescription?: SessionDescription;
 }
 
 export interface SubscribeTracksResponse {

@@ -7,13 +7,14 @@
 import {useRef, useState, useEffect} from 'react';
 import {API_CONFIG} from '../constants/api';
 import sfuApiService from '../services/sfuApiService';
-import type {RoomInfoResponse} from '../types/sfu';
+import type {RoomInfoResponse, EstablishDataChannelsResponse} from '../types/sfu';
 
 const API_BASE = API_CONFIG.BASE_URL;
 const AUTH_BASE = API_CONFIG.BASE_URL_AUTH;
 const ROOM_ID = 'pmZYT4i4';
 const STORAGE_KEY = API_CONFIG.STORAGE_TOKEN_KEY;
 const ROOM_POLL_INTERVAL_MS = 8000;
+const MUTE_DATA_CHANNEL_NAME = 'mute-signal';
 
 function getHeader(token: string) {
     return {
@@ -100,9 +101,15 @@ export default function VideoCall() {
     const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
     const remoteSubscribedSessionIdRef = useRef<string | null>(null);
     const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const localStreamRef = useRef<MediaStream | null>(null);
+    const muteDataChannelRef = useRef<RTCDataChannel | null>(null);
+    const remotePeerConnectionRef = useRef<RTCPeerConnection | null>(null);
+    const mutedRef = useRef(false);
 
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
+    const [muted, setMuted] = useState(false);
+    const [remoteMuted, setRemoteMuted] = useState(false);
 
     async function handleLogin(e: React.FormEvent) {
         e.preventDefault();
@@ -132,6 +139,10 @@ export default function VideoCall() {
         mySessionIdRef.current = null;
         peerConnectionRef.current = null;
         remoteSubscribedSessionIdRef.current = null;
+        localStreamRef.current = null;
+        muteDataChannelRef.current = null;
+        remotePeerConnectionRef.current = null;
+        setRemoteMuted(false);
         const localVideo = localVideoRef.current;
         const remoteVideo = remoteVideoRef.current;
         if (localVideo?.srcObject) {
@@ -143,12 +154,151 @@ export default function VideoCall() {
         }
     }
 
+    function handleMute() {
+        const stream = localStreamRef.current;
+        if (!stream) return;
+        const audioTrack = stream.getAudioTracks()[0];
+        if (audioTrack) {
+            audioTrack.enabled = !audioTrack.enabled;
+            const newMuted = !audioTrack.enabled;
+            mutedRef.current = newMuted;
+            setMuted(newMuted);
+            const dc = muteDataChannelRef.current;
+            if (dc?.readyState === 'open') {
+                try {
+                    dc.send(JSON.stringify({muted: newMuted}));
+                } catch (e) {
+                    console.warn('Send mute state:', e);
+                }
+            }
+        }
+    }
+
+    async function handleLeaveChat() {
+        const sessionId = mySessionIdRef.current;
+        const pc = peerConnectionRef.current;
+        if (!sessionId || !pc) return;
+        try {
+            const transceivers = pc.getTransceivers();
+            const tracks = transceivers
+                .filter((t) => t.mid != null && t.sender.track)
+                .map((t) => ({mid: t.mid!}));
+
+            let sessionDescription: { type: string; sdp: string };
+            if (pc.localDescription?.sdp) {
+                sessionDescription = {
+                    type: pc.localDescription.type,
+                    sdp: pc.localDescription.sdp,
+                };
+            } else {
+                const offer = await pc.createOffer();
+                sessionDescription = {type: offer.type, sdp: offer.sdp};
+            }
+
+            await sfuApiService.leaveChatSession(sessionId, {
+                tracks,
+                sessionDescription,
+                force: false,
+            });
+        } catch (e) {
+            console.warn('Leave chat:', e);
+        }
+    }
+
+    async function handleLeaveRoom() {
+        if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+        }
+        remoteSubscribedSessionIdRef.current = null;
+        const pc = peerConnectionRef.current;
+        if (pc) {
+            pc.close();
+            peerConnectionRef.current = null;
+        }
+        mySessionIdRef.current = null;
+        const localVideo = localVideoRef.current;
+        const remoteVideo = remoteVideoRef.current;
+        if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach((t) => t.stop());
+            localStreamRef.current = null;
+        }
+        if (localVideo?.srcObject) {
+            localVideo.srcObject = null;
+        }
+        if (remoteVideo?.srcObject) {
+            remoteVideo.srcObject = null;
+        }
+        setInCall(false);
+        setMuted(false);
+        setRemoteMuted(false);
+        muteDataChannelRef.current = null;
+        remotePeerConnectionRef.current = null;
+        try {
+            await sfuApiService.leaveRoom(ROOM_ID);
+        } catch (e) {
+            console.warn('Leave room:', e);
+        }
+    }
+
+    async function establishDataChannelTransport(
+        pc: RTCPeerConnection,
+        sessionId: string
+    ) {
+        const dc = pc.createDataChannel('server-events', {negotiated: false});
+        dc.onmessage = (m) => console.log('Server event:', m);
+        const hasLocalDescription = pc.localDescription != null;
+        let request: EstablishDataChannelsRequest = {
+            dataChannel: {location: 'remote', dataChannelName: 'server-events'},
+        };
+        if (!hasLocalDescription) {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            request.sessionDescription = {type: 'offer', sdp: offer.sdp};
+        }
+        const response = await sfuApiService.establishDataChannels(sessionId, request);
+        const respData = (response as { data?: EstablishDataChannelsResponse }).data || response as EstablishDataChannelsResponse;
+        if (respData.requiresImmediateRenegotiation && respData.sessionDescription) {
+            await pc.setRemoteDescription(
+                new RTCSessionDescription(respData.sessionDescription)
+            );
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            await sfuApiService.renegotiate(sessionId, {
+                sessionDescription: {sdp: answer.sdp, type: 'answer'},
+            });
+        } else if (respData.sessionDescription) {
+            await pc.setRemoteDescription(
+                new RTCSessionDescription(respData.sessionDescription)
+            );
+        }
+    }
+
+    async function establishAndPublishMuteDataChannel(
+        pc: RTCPeerConnection,
+        sessionId: string
+    ) {
+        const response = await sfuApiService.publishDataChannels(sessionId, {
+            dataChannels: [{location: 'local', dataChannelName: MUTE_DATA_CHANNEL_NAME}],
+        });
+        const channelId = response.data?.dataChannels?.[0]?.id;
+        if (channelId == null) throw new Error('No data channel ID returned');
+        const dc = pc.createDataChannel(MUTE_DATA_CHANNEL_NAME, {
+            negotiated: true,
+            id: channelId,
+        });
+        muteDataChannelRef.current = dc;
+        dc.onopen = () => {
+            try {
+                dc.send(JSON.stringify({muted: mutedRef.current}));
+            } catch (_) {}
+        };
+    }
+
     async function doRemoteUserFlow(
         otherSessionId: string,
-        tracks: { audio?: string; video?: string },
-        token: string,
-        remoteVideo: HTMLVideoElement,
-        existingPC: RTCPeerConnection // Pass the PC from handleJoinCall
+        tracks: { audio?: string; video?: string; dataChannel?: string },
+        remoteVideo: HTMLVideoElement
     ) {
         const tracksToPull: Array<{
             location: 'remote';
@@ -171,67 +321,21 @@ export default function VideoCall() {
         }
         if (tracksToPull.length === 0) return;
 
-
-        /*        const mySessionId = mySessionIdRef.current;
-
-                // 1. Tell the API we want to subscribe
-                const pullResponse = await fetch(
-                    `${API_BASE}/sessions/${mySessionId}/tracks/subscribe`,
-                    {
-                        method: 'POST',
-                        headers: getHeader(token),
-                        body: JSON.stringify({tracks: tracksToPull}),
-                    }
-                ).then((r) => r.json());
-
-                // 2. Handle the Renegotiation Cloudflare requires
-                if (pullResponse.data.requiresImmediateRenegotiation) {
-                    await existingPC.setRemoteDescription(
-                        new RTCSessionDescription(pullResponse.data.sessionDescription)
-                    );
-
-                    // Create an answer to the offer Cloudflare just gave us
-                    const answer = await existingPC.createAnswer();
-                    await existingPC.setLocalDescription(answer);
-
-                    // Send the answer back
-                    await fetch(`${API_BASE}/sessions/${mySessionId}/renegotiate`, {
-                        method: 'PUT',
-                        headers: getHeader(token),
-                        body: JSON.stringify({
-                            sessionDescription: {sdp: answer.sdp, type: 'answer'},
-                        }),
-                    });
-                }
-                console.log("---------------")
-                console.log(existingPC)
-                console.log(existingPC.ontrack)
-
-                // 3. Listen for the tracks on the EXISTING PC
-                existingPC.ontrack = (e) => {
-                    console.log("🔥 Remote track received!", e.streams[0]);
-                    if (remoteVideo.srcObject !== e.streams[0]) {
-                        remoteVideo.srcObject = e.streams[0];
-                    }
-                };*/
-
-
-        // const remotePeerConnection = createPeerConnection();
-        if (!peerConnectionRef.current)
-            throw new Error("RTC Peer null");
+        if (!peerConnectionRef.current || !mySessionIdRef.current) return;
         const remotePeerConnection = peerConnectionRef.current;
         const mySessionId = mySessionIdRef.current;
-        const pullResponse = await fetch(
-            `${API_BASE}/sessions/${mySessionId}/tracks/subscribe`,
-            {
-                method: 'POST',
-                headers: getHeader(token),
-                body: JSON.stringify({tracks: tracksToPull}),
-            }
-        ).then((r) => r.json());
+        remotePeerConnectionRef.current = remotePeerConnection;
+
+        const localSdp = remotePeerConnection.localDescription;
+        if (!localSdp) throw new Error('Peer connection has no local description');
+        const pullResponse = await sfuApiService.subscribeTracks(mySessionId, {
+            tracks: tracksToPull,
+            sessionDescription: {type: localSdp.type as 'offer' | 'answer', sdp: localSdp.sdp},
+        });
+
         const resolvingTracks = Promise.all(
             pullResponse.data.tracks.map(
-                ({mid}: { mid: string }) =>
+                ({mid}/*: { mid: string }*/) =>
                     new Promise<MediaStreamTrack>((res, rej) => {
                         setTimeout(
                             () => rej(new Error(`Track with mid ${mid} not received in time`)),
@@ -257,21 +361,11 @@ export default function VideoCall() {
             );
             const remoteAnswer = await remotePeerConnection.createAnswer();
             await remotePeerConnection.setLocalDescription(remoteAnswer);
-            const renegotiateResponse = await fetch(
-                `${API_BASE}/sessions/${mySessionId}/renegotiate`,
-                {
-                    method: 'PUT',
-                    headers: getHeader(token),
-                    body: JSON.stringify({
-                        sessionDescription: {
-                            sdp: remoteAnswer.sdp,
-                            type: 'answer'
-                        },
-                    }),
-                }
-            ).then((r) => r.json());
-            if (renegotiateResponse.errorCode) {
-                throw new Error(renegotiateResponse.errorDescription);
+            const renegotiateResponse = await sfuApiService.renegotiate(mySessionId, {
+                sessionDescription: {sdp: remoteAnswer.sdp, type: 'answer'},
+            });
+            if ((renegotiateResponse as { errorCode?: string; errorDescription?: string }).errorCode) {
+                throw new Error((renegotiateResponse as { errorDescription?: string }).errorDescription);
             }
         }
 
@@ -279,6 +373,29 @@ export default function VideoCall() {
         const remoteVideoStream = new MediaStream();
         remoteVideo.srcObject = remoteVideoStream;
         pulledTracks.forEach((t) => remoteVideoStream.addTrack(t));
+
+        const dcResponse = await sfuApiService.subscribeDataChannels(mySessionId, {
+            dataChannels: [
+                {
+                    location: 'remote',
+                    sessionId: otherSessionId,
+                    dataChannelName: MUTE_DATA_CHANNEL_NAME,
+                },
+            ],
+        });
+        const channelId = dcResponse.data?.dataChannels?.[0]?.id;
+        if (channelId != null) {
+            const dc = remotePeerConnection.createDataChannel(`${MUTE_DATA_CHANNEL_NAME}-subscribed`, {
+                negotiated: true,
+                id: channelId,
+            });
+            dc.onmessage = (ev: MessageEvent) => {
+                try {
+                    const {muted} = JSON.parse(ev.data as string) as { muted?: boolean };
+                    if (typeof muted === 'boolean') setRemoteMuted(muted);
+                } catch (_) {}
+            };
+        }
     }
 
     async function handleJoinCall() {
@@ -301,6 +418,7 @@ export default function VideoCall() {
                 audio: true,
                 video: true,
             });
+            localStreamRef.current = media;
             localVideo.srcObject = media;
 
             const mySessionId = await createCallsSession(userToken, true);
@@ -308,6 +426,19 @@ export default function VideoCall() {
 
             const localPeerConnection = createPeerConnection();
             peerConnectionRef.current = localPeerConnection;
+
+            localPeerConnection.ondatachannel = (e: RTCDataChannelEvent) => {
+                const ch = e.channel;
+                if (ch.label === MUTE_DATA_CHANNEL_NAME) {
+                    ch.onmessage = (ev: MessageEvent) => {
+                        try {
+                            const {muted} = JSON.parse(ev.data as string) as { muted?: boolean };
+                            if (typeof muted === 'boolean') setRemoteMuted(muted);
+                        } catch (_) {}
+                    };
+                }
+            };
+
             const transceivers = media.getTracks().map((track) =>
                 localPeerConnection.addTransceiver(track, {direction: 'sendonly'})
             );
@@ -332,6 +463,7 @@ export default function VideoCall() {
                 }
             ).then((r) => r.json());
 
+
             const connected = new Promise<void>((res, rej) => {
                 setTimeout(() => rej(new Error('ICE timeout')), 5000);
                 const handler = () => {
@@ -353,6 +485,15 @@ export default function VideoCall() {
                 new RTCSessionDescription(pushTracksResponse.data.sessionDescription)
             );
             await connected;
+
+            await establishDataChannelTransport(localPeerConnection, mySessionId).catch((e) =>
+                console.warn('Data channel transport setup:', e)
+            );
+
+            await establishAndPublishMuteDataChannel(
+                localPeerConnection,
+                mySessionId
+            ).catch((e) => console.warn('Mute data channel setup:', e));
 
             setInCall(true);
         } catch (e) {
@@ -388,9 +529,7 @@ export default function VideoCall() {
                 await doRemoteUserFlow(
                     other.sessionId,
                     other.tracks,
-                    userToken,
-                    remoteVideo,
-                    peerConnectionRef.current
+                    remoteVideo
                 );
                 if (pollIntervalRef.current) {
                     clearInterval(pollIntervalRef.current);
@@ -447,47 +586,96 @@ export default function VideoCall() {
     }
 
     return (
-        <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4 max-sm:grid-cols-1">
-            <div className="col-span-full flex justify-between items-center">
+        <div className="flex flex-col min-h-screen">
+            <div className="flex justify-between items-center px-4 py-3 shrink-0">
                 <h1 className="text-xl font-normal">Video Call</h1>
                 <button
                     type="button"
                     onClick={handleLogout}
-                    className="text-red-600 hover:underline text-sm"
+                    className="text-red-500 hover:text-red-400 text-sm font-medium transition-colors"
                 >
                     Logout
                 </button>
             </div>
-            <div className="col-span-full">
-                <button
-                    type="button"
-                    onClick={handleJoinCall}
-                    disabled={loading}
-                    className="bg-green-600 text-white px-4 py-2 rounded disabled:opacity-50"
-                >
-                    {loading ? 'Joining…' : 'Join call'}
-                </button>
+            <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4 max-sm:grid-cols-1 px-4 flex-1">
+                <div>
+                    <h2 className="text-base font-normal mb-2">Local stream</h2>
+                    <video
+                        ref={localVideoRef}
+                        autoPlay
+                        playsInline
+                        muted
+                        className="w-full bg-black rounded-lg"
+                    />
+                </div>
+                <div>
+                    <h2 className="text-base font-normal mb-2">Remote stream</h2>
+                    <div className="relative w-full bg-black rounded-lg">
+                        <video
+                            ref={remoteVideoRef}
+                            autoPlay
+                            playsInline
+                            className="w-full rounded-lg"
+                        />
+                        {remoteMuted && (
+                            <div
+                                className="absolute inset-0 flex items-center justify-center bg-black/40 rounded-lg pointer-events-none"
+                                aria-hidden
+                            >
+                                <span className="rounded-full bg-red-500/90 p-2" title="Remote muted">
+                                    <svg className="w-6 h-6 text-white" fill="currentColor" viewBox="0 0 24 24"
+                                         aria-hidden>
+                                        <path
+                                            d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.2 14.47 16 12 16s-4.52-1.8-4.93-4.15c-.08-.49-.49-.85-.98-.85-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V20c0 .55.45 1 1 1s1-.45 1-1v-2.08c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/>
+                                    </svg>
+                                </span>
+                            </div>
+                        )}
+                    </div>
+                </div>
             </div>
-            <div>
-                <h2 className="text-base font-normal mb-2">Local stream</h2>
-                <video
-                    ref={localVideoRef}
-                    autoPlay
-                    playsInline
-                    muted
-                    className="w-full bg-black"
-                />
+            {error && <p className="text-red-500 px-4 text-sm">{error}</p>}
+            <div className="flex justify-center items-center gap-2 py-4 px-4 shrink-0">
+                {!inCall ? (
+                    <button
+                        type="button"
+                        onClick={handleJoinCall}
+                        disabled={loading}
+                        className="rounded-full px-4 py-2 text-sm font-medium bg-green-600 text-white border border-green-600 hover:bg-green-700 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+                    >
+                        {loading ? 'Joining…' : 'Join'}
+                    </button>
+                ) : (
+                    <>
+                        <button
+                            type="button"
+                            onClick={handleMute}
+                            className={`rounded-full px-4 py-2 text-sm font-medium border transition-colors ${
+                                muted
+                                    ? 'bg-red-500/20 border-red-400/50 text-red-400'
+                                    : 'bg-white/5 border-white/10 hover:bg-white/10'
+                            }`}
+                            title={muted ? 'Unmute' : 'Mute'}
+                        >
+                            {muted ? 'Unmute' : 'Mute'}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={handleLeaveChat}
+                            className="rounded-full px-4 py-2 text-sm font-medium border border-white/10 bg-white/5 hover:bg-white/10 transition-colors"
+                        >
+                            Leave chat
+                        </button>
+                        <button
+                            type="button"
+                            onClick={handleLeaveRoom}
+                            className="rounded-full px-4 py-2 text-sm font-medium border border-red-400/40 bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-colors"
+                        >
+                            Leave room
+                        </button>
+                    </>
+                )}
             </div>
-            <div>
-                <h2 className="text-base font-normal mb-2">Remote stream</h2>
-                <video
-                    ref={remoteVideoRef}
-                    autoPlay
-                    playsInline
-                    className="w-full bg-black"
-                />
-            </div>
-            {error && <p className="text-red-600 col-span-full">{error}</p>}
         </div>
     );
 }

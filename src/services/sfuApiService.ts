@@ -10,6 +10,8 @@ import type {
     SubscribeTracksRequest,
     SubscribeTracksResponse,
     SubscribeDataChannelsRequest,
+    EstablishDataChannelsRequest,
+    EstablishDataChannelsResponse,
     RenegotiateRequest,
     CloseTracksRequest,
     LeaveChatRequest,
@@ -113,7 +115,19 @@ class SFUApiService {
         return response.data;
     }
 
-    // 4. Publish Data Channel Track
+    // 4a. Establish Data Channel Transport (call first, before publish/subscribe)
+    async establishDataChannels(
+        sessionId: string,
+        request: EstablishDataChannelsRequest
+    ): Promise<EstablishDataChannelsResponse> {
+        const response = await this.api.post<EstablishDataChannelsResponse>(
+            `/sessions/${sessionId}/data-channels/establish`,
+            request
+        );
+        return response.data;
+    }
+
+    // 4b. Publish Data Channel (uses /datachannels/new, returns ID for negotiated channel)
     async publishDataChannels(
         sessionId: string,
         request: PublishDataChannelsRequest
@@ -134,12 +148,12 @@ class SFUApiService {
         return response.data;
     }
 
-    // 6. Subscribe to Presence Data Channels
+    // 6. Subscribe to Data Channels (uses /datachannels/new, returns ID for negotiated channel)
     async subscribeDataChannels(
         sessionId: string,
         request: SubscribeDataChannelsRequest
-    ): Promise<ApiResponse> {
-        const response = await this.api.post<ApiResponse>(
+    ): Promise<PublishDataChannelsResponse> {
+        const response = await this.api.post<PublishDataChannelsResponse>(
             `/sessions/${sessionId}/data-channels/subscribe`,
             request
         );
@@ -197,11 +211,20 @@ class SFUApiService {
         return response.data;
     }
 
-    // 12. Leave Chat-Only Session (optional body with SDP for proper teardown)
+    // 12. Leave Chat-Only Session (room-based; optional body)
     async leaveChat(roomToken: string, request?: LeaveChatRequest): Promise<ApiResponse> {
         const response = await this.api.post<ApiResponse>(
             `/rooms/${roomToken}/leave-chat`,
             request ?? {}
+        );
+        return response.data;
+    }
+
+    // 13. Leave Chat by Session (session-based; requires tracks + sessionDescription)
+    async leaveChatSession(sessionId: string, request: LeaveChatRequest): Promise<ApiResponse> {
+        const response = await this.api.post<ApiResponse>(
+            `/sessions/${sessionId}/leave-chat`,
+            request
         );
         return response.data;
     }
