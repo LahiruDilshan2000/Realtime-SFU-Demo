@@ -9,6 +9,7 @@ import {useRef, useState, useEffect} from 'react';
 import {API_CONFIG} from '../constants/api';
 import sfuApiService from '../services/sfuApiService';
 import type {RoomInfoResponse, EstablishDataChannelsResponse, EstablishDataChannelsRequest} from '../types/sfu';
+import {JoinRequest} from "../types/sfu";
 
 const API_BASE = API_CONFIG.BASE_URL;
 const AUTH_BASE = API_CONFIG.BASE_URL_AUTH;
@@ -58,6 +59,7 @@ async function createCallsSession(
     token: string,
     withMedia: boolean
 ): Promise<string> {
+
     const res = await fetch(`${API_BASE}/rooms/${ROOM_ID}/join`, {
         method: 'POST',
         headers: getHeader(token),
@@ -115,9 +117,19 @@ export default function VideoCall() {
     const [muted, setMuted] = useState(false);
     const [remoteMuted, setRemoteMuted] = useState(false);
     const [chatOpen, setChatOpen] = useState(false);
-    const [chatMessages, setChatMessages] = useState<Array<{id: string; text: string; sender: 'me' | 'other'; timestamp: number}>>([]);
+    const [chatMessages, setChatMessages] = useState<Array<{
+        id: string;
+        text: string;
+        sender: 'me' | 'other';
+        timestamp: number
+    }>>([]);
     const [chatInput, setChatInput] = useState('');
-    const [notifications, setNotifications] = useState<Array<{id: string; message: string; type: 'join' | 'leave'; timestamp: number}>>([]);
+    const [notifications, setNotifications] = useState<Array<{
+        id: string;
+        message: string;
+        type: 'join' | 'leave';
+        timestamp: number
+    }>>([]);
     const previousParticipantsRef = useRef<Set<string>>(new Set());
     const joinNotificationReadyRef = useRef(false);
     const chatDcOpenBeforeReadyRef = useRef(false);
@@ -295,7 +307,9 @@ export default function VideoCall() {
             request.sessionDescription = {type: 'offer', sdp: offer.sdp};
         }
         const response = await sfuApiService.establishDataChannels(sessionId, request);
-        const respData = (response as { data?: EstablishDataChannelsResponse }).data || response as EstablishDataChannelsResponse;
+        const respData = (response as {
+            data?: EstablishDataChannelsResponse
+        }).data || response as EstablishDataChannelsResponse;
         if (respData.requiresImmediateRenegotiation && respData.sessionDescription) {
             await pc.setRemoteDescription(
                 new RTCSessionDescription(respData.sessionDescription)
@@ -329,7 +343,8 @@ export default function VideoCall() {
         dc.onopen = () => {
             try {
                 dc.send(JSON.stringify({muted: mutedRef.current}));
-            } catch (_) {}
+            } catch (_) {
+            }
         };
     }
 
@@ -510,7 +525,8 @@ export default function VideoCall() {
                 try {
                     const {muted} = JSON.parse(ev.data as string) as { muted?: boolean };
                     if (typeof muted === 'boolean') setRemoteMuted(muted);
-                } catch (_) {}
+                } catch (_) {
+                }
             };
         }
 
@@ -557,7 +573,8 @@ export default function VideoCall() {
                             showNotification(msg, 'leave');
                         }
                     }
-                } catch (_) {}
+                } catch (_) {
+                }
             };
         }
     }
@@ -586,6 +603,10 @@ export default function VideoCall() {
             localVideo.srcObject = media;
 
             const mySessionId = await createCallsSession(userToken, true);
+            // const joinRequest: JoinRequest = {
+            //     mediaConstraints: {video: true, audio: true},
+            // }
+            // const mySessionId = await sfuApiService.joinRoom(ROOM_ID, joinRequest);
             mySessionIdRef.current = mySessionId;
 
             const localPeerConnection = createPeerConnection();
@@ -598,7 +619,8 @@ export default function VideoCall() {
                         try {
                             const {muted} = JSON.parse(ev.data as string) as { muted?: boolean };
                             if (typeof muted === 'boolean') setRemoteMuted(muted);
-                        } catch (_) {}
+                        } catch (_) {
+                        }
                     };
                 } else if (ch.label === CHAT_DATA_CHANNEL_NAME || ch.label === `${CHAT_DATA_CHANNEL_NAME}-subscribed`) {
                     ch.onmessage = (ev: MessageEvent) => {
@@ -629,7 +651,8 @@ export default function VideoCall() {
                                     showNotification(msg, 'leave');
                                 }
                             }
-                        } catch (_) {}
+                        } catch (_) {
+                        }
                     };
                 }
             };
@@ -829,12 +852,16 @@ export default function VideoCall() {
                     >
                         <div className="flex items-center gap-2">
                             {notif.type === 'join' ? (
-                                <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" />
+                                <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor"
+                                     viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                                          d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"/>
                                 </svg>
                             ) : (
-                                <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                                <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor"
+                                     viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                                          d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
                                 </svg>
                             )}
                             <span>{notif.message}</span>
@@ -852,7 +879,8 @@ export default function VideoCall() {
                     Logout
                 </button>
             </div>
-            <div className={`grid gap-4 px-4 flex-1 ${chatOpen ? 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)_320px] max-lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]' : 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)]'} max-sm:grid-cols-1`}>
+            <div
+                className={`grid gap-4 px-4 flex-1 ${chatOpen ? 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)_320px] max-lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]' : 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)]'} max-sm:grid-cols-1`}>
                 <div className="relative">
                     <h2 className="text-base font-normal mb-2">Local stream</h2>
                     <div className="relative w-full bg-black rounded-lg">
@@ -863,7 +891,8 @@ export default function VideoCall() {
                             muted
                             className="w-full bg-black rounded-lg"
                         />
-                        <span className="absolute bottom-2 right-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">
+                        <span
+                            className="absolute bottom-2 right-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">
                             You
                         </span>
                     </div>
@@ -877,7 +906,8 @@ export default function VideoCall() {
                             playsInline
                             className="w-full rounded-lg"
                         />
-                        <span className="absolute bottom-2 right-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">
+                        <span
+                            className="absolute bottom-2 right-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">
                             {remoteParticipantDisplayName || 'Remote'}
                         </span>
                         {remoteMuted && (
@@ -906,7 +936,8 @@ export default function VideoCall() {
                                 className="text-white/60 hover:text-white"
                             >
                                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                                          d="M6 18L18 6M6 6l12 12"/>
                                 </svg>
                             </button>
                         </div>
@@ -928,13 +959,16 @@ export default function VideoCall() {
                                         >
                                             <p className="text-sm">{msg.text}</p>
                                             <p className={`text-xs mt-1 ${msg.sender === 'me' ? 'text-green-100' : 'text-white/60'}`}>
-                                                {new Date(msg.timestamp).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}
+                                                {new Date(msg.timestamp).toLocaleTimeString([], {
+                                                    hour: '2-digit',
+                                                    minute: '2-digit'
+                                                })}
                                             </p>
                                         </div>
                                     </div>
                                 ))
                             )}
-                            <div ref={chatMessagesEndRef} />
+                            <div ref={chatMessagesEndRef}/>
                         </div>
                         <div className="p-3 border-t border-white/10">
                             <form
@@ -974,7 +1008,8 @@ export default function VideoCall() {
                             className="text-white/60 hover:text-white"
                         >
                             <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                                      d="M6 18L18 6M6 6l12 12"/>
                             </svg>
                         </button>
                     </div>
@@ -996,13 +1031,16 @@ export default function VideoCall() {
                                     >
                                         <p className="text-sm">{msg.text}</p>
                                         <p className={`text-xs mt-1 ${msg.sender === 'me' ? 'text-green-100' : 'text-white/60'}`}>
-                                            {new Date(msg.timestamp).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}
+                                            {new Date(msg.timestamp).toLocaleTimeString([], {
+                                                hour: '2-digit',
+                                                minute: '2-digit'
+                                            })}
                                         </p>
                                     </div>
                                 </div>
                             ))
                         )}
-                        <div ref={chatMessagesEndRef} />
+                        <div ref={chatMessagesEndRef}/>
                     </div>
                     <div className="p-4 border-t border-white/10">
                         <form

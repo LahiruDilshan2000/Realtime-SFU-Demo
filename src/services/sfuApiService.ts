@@ -85,26 +85,11 @@ class SFUApiService {
     }
 
     // 2. Join Room & Create SFU Session
-    async joinRoom(roomToken: string, request: JoinRequest): Promise<JoinResponse> {
+    async joinRoom(roomToken: string, request: JoinRequest): Promise<string> {
         const response = await this.api.post<JoinResponse>(`/rooms/${roomToken}/join`, request);
-        return response.data;
+        return response.data.data.sessionId;
     }
 
-    // 2.5. Send Initial Offer (Establish Connection)
-    // This is for the initial WebRTC connection (CREATED → CONNECTED)
-    // POST /api/v1/talk/sfu/offer (as per user's documentation)
-    async sendOffer(sessionId: string, offer: SessionDescription): Promise<ApiResponse<{
-        sessionDescription: SessionDescription
-    }>> {
-        const response = await this.api.post<ApiResponse<{ sessionDescription: SessionDescription }>>(
-            `/sfu/offer`,
-            {
-                sessionId,
-                sdp: offer.sdp
-            }
-        );
-        return response.data;
-    }
 
     // 3. Publish Media Tracks
     async publishTracks(sessionId: string, request: PublishTracksRequest): Promise<PublishTracksResponse> {
@@ -208,15 +193,6 @@ class SFUApiService {
     // 11. Join Room for Chat-Only (No Media)
     async joinRoomForChat(roomToken: string, request: JoinRequest): Promise<JoinResponse> {
         const response = await this.api.post<JoinResponse>(`/rooms/${roomToken}/join-chat`, request);
-        return response.data;
-    }
-
-    // 12. Leave Chat-Only Session (room-based; optional body)
-    async leaveChat(roomToken: string, request?: LeaveChatRequest): Promise<ApiResponse> {
-        const response = await this.api.post<ApiResponse>(
-            `/rooms/${roomToken}/leave-chat`,
-            request ?? {}
-        );
         return response.data;
     }
 
