@@ -1,9 +1,6 @@
 /**
- * User must log in first; token in localStorage.
- * Join flow: get media, join room, publish video/audio/data channels.
- * After publish, connect WebSocket and send JOIN_ROOM with track info.
- * Backend broadcasts USER_JOINED (existing + new users) and USER_LEFT.
- * No presence data channel, no getRoomInfo polling.
+ * Video Call - SFU-based WebRTC with WebSocket presence.
+ * Flow: Login → Join room → Publish tracks → WebSocket JOIN_ROOM → Receive USER_JOINED/USER_LEFT.
  */
 import {useRef, useState, useEffect} from 'react';
 import {API_CONFIG} from '../constants/api';
@@ -16,6 +13,10 @@ const STORAGE_KEY = API_CONFIG.STORAGE_TOKEN_KEY;
 const MUTE_DATA_CHANNEL_NAME = 'mute-signal';
 const CHAT_DATA_CHANNEL_NAME = 'chat';
 
+/**
+ * Returns auth headers for API requests.
+ * Step: Build object with Bearer token and JSON content-type.
+ */
 function getHeader(token: string) {
     return {
         Authorization: `Bearer ${token}`,
@@ -23,23 +24,30 @@ function getHeader(token: string) {
     };
 }
 
+/** Returns JWT from localStorage, or null if not found / SSR. */
 function getStoredToken(): string | null {
     if (typeof window === 'undefined') return null;
     return localStorage.getItem(STORAGE_KEY);
 }
 
+/** Saves JWT to localStorage. */
 function saveToken(token: string): void {
     if (typeof window !== 'undefined') {
         localStorage.setItem(STORAGE_KEY, token);
     }
 }
 
+/** Removes JWT from localStorage. */
 function clearToken(): void {
     if (typeof window !== 'undefined') {
         localStorage.removeItem(STORAGE_KEY);
     }
 }
 
+/**
+ * Signs in via auth API.
+ * Steps: POST /signin → parse response → return token or throw.
+ */
 async function signIn(username: string, password: string): Promise<string> {
     const res = await fetch(`${AUTH_BASE}/signin`, {
         method: 'POST',
@@ -52,6 +60,10 @@ async function signIn(username: string, password: string): Promise<string> {
     return res.token;
 }
 
+/**
+ * Joins room and creates SFU session.
+ * Steps: POST /rooms/:id/join → return sessionId.
+ */
 async function createCallsSession(
     token: string,
     withMedia: boolean
@@ -67,6 +79,7 @@ async function createCallsSession(
     return res.data.sessionId;
 }
 
+/** Creates RTCPeerConnection with STUN and bundle policy. */
 function createPeerConnection(): RTCPeerConnection {
     return new RTCPeerConnection({
         iceServers: [{urls: 'stun:stun.cloudflare.com:3478'}],
@@ -118,6 +131,10 @@ export default function VideoCall() {
     const chatDcOpenBeforeReadyRef = useRef(false);
     const [remoteParticipantDisplayName, setRemoteParticipantDisplayName] = useState('');
 
+    /**
+     * Handles login form submit.
+     * Steps: Prevent default → signIn → save token → set token state.
+     */
     async function handleLogin(e: React.FormEvent) {
         e.preventDefault();
         setLoginError(null);
@@ -133,7 +150,15 @@ export default function VideoCall() {
         }
     }
 
+    /**
+     * Handles logout.
+     * Steps: Clear token → clear API auth → reset all refs/state → stop media tracks.
+     */
     function handleLogout() {
+        if (roomWsRef.current) {
+            roomWsRef.current.close();
+            roomWsRef.current = null;
+        }
         clearToken();
         sfuApiService.clearAuthToken();
         setToken(null);
@@ -161,6 +186,10 @@ export default function VideoCall() {
         }
     }
 
+    /**
+     * Toggles local audio mute.
+     * Steps: Flip audioTrack.enabled → update state → send mute state over mute data channel.
+     */
     function handleMute() {
         const stream = localStreamRef.current;
         if (!stream) return;
@@ -181,6 +210,10 @@ export default function VideoCall() {
         }
     }
 
+    /**
+     * Leaves chat gracefully.
+     * Steps: Send leave notification → wait 300ms → leaveChatSession API → doLeaveCleanup.
+     */
     async function handleLeaveChat() {
         const sessionId = mySessionIdRef.current;
         const pc = peerConnectionRef.current;
@@ -216,6 +249,10 @@ export default function VideoCall() {
         doLeaveCleanup();
     }
 
+    /**
+     * Leaves room.
+     * Steps: Send leave notification → doLeaveCleanup → leaveRoom API.
+     */
     async function handleLeaveRoom() {
         sendNotificationEvent('leave');
         doLeaveCleanup();
@@ -226,6 +263,10 @@ export default function VideoCall() {
         }
     }
 
+    /**
+     * Cleans up call state and resources.
+     * Steps: Close WebSocket → clear refs → close peer connection → stop tracks → reset state.
+     */
     function doLeaveCleanup() {
         if (roomWsRef.current) {
             roomWsRef.current.close();
@@ -265,6 +306,10 @@ export default function VideoCall() {
         setRemoteParticipantDisplayName('');
     }
 
+    /**
+     * Publishes mute data channel to SFU.
+     * Steps: publishDataChannels API → create negotiated DC → onopen send current mute state.
+     */
     async function establishAndPublishMuteDataChannel(
         pc: RTCPeerConnection,
         sessionId: string
@@ -287,6 +332,10 @@ export default function VideoCall() {
         };
     }
 
+    /**
+     * Publishes chat data channel to SFU.
+     * Steps: publishDataChannels API → create negotiated DC → onopen send join notification if ready.
+     */
     async function establishAndPublishChatDataChannel(
         pc: RTCPeerConnection,
         sessionId: string
@@ -310,10 +359,11 @@ export default function VideoCall() {
         };
     }
 
+    /**
+     * Shows toast notification (join/leave).
+     * Steps: Add to state → auto-remove after 5s.
+     */
     function showNotification(message: string, type: 'join' | 'leave') {
-        if (type === 'join') {
-            console.log('[Notification] Showing user joined:', message);
-        }
         const id = `notif-${Date.now()}-${Math.random()}`;
         setNotifications((prev) => [...prev, {id, message, type, timestamp: Date.now()}]);
         setTimeout(() => {
@@ -321,6 +371,10 @@ export default function VideoCall() {
         }, 5000);
     }
 
+    /**
+     * Sends join/leave notification over chat data channel.
+     * Steps: Build payload → send JSON if chat DC is open.
+     */
     function sendNotificationEvent(event: 'join' | 'leave', displayName?: string) {
         const dc = chatDataChannelRef.current;
         if (dc?.readyState === 'open') {
@@ -338,12 +392,21 @@ export default function VideoCall() {
         }
     }
 
+    /**
+     * Sends join notification when chat DC is open.
+     * Called after publish or when chat DC opens (if ready).
+     */
     function sendJoinNotificationWhenReady() {
         const dc = chatDataChannelRef.current;
         if (!dc || dc.readyState !== 'open') return;
         sendNotificationEvent('join', 'User');
     }
 
+    /**
+     * Connects to room WebSocket for presence.
+     * Steps: Open WS → onopen send JOIN_ROOM with track info → onmessage handle USER_JOINED/USER_LEFT.
+     * USER_JOINED: subscribe to that user (doRemoteUserFlow). USER_LEFT: cleanup remote.
+     */
     function connectRoomWebSocket() {
         const wsUrl = API_CONFIG.WS_ROOM_URL;
         if (!wsUrl) {
@@ -421,6 +484,10 @@ export default function VideoCall() {
         ws.onclose = () => { roomWsRef.current = null; };
     }
 
+    /**
+     * Sends chat message.
+     * Steps: Trim input → send over chat DC → add to local messages state.
+     */
     function handleSendChatMessage() {
         if (!chatInput.trim() || !chatDataChannelRef.current) return;
         const message = chatInput.trim();
@@ -446,9 +513,18 @@ export default function VideoCall() {
         }
     }
 
+    /**
+     * Subscribes to a remote user's tracks and data channels.
+     * Steps:
+     * 1. subscribeTracks API (audio, video)
+     * 2. Wait for track events or renegotiate
+     * 3. Attach tracks to remote video element
+     * 4. subscribeDataChannels for mute and chat
+     * 5. Set up onmessage handlers for mute state and chat/notifications
+     */
     async function doRemoteUserFlow(
         otherSessionId: string,
-        tracks: { audio?: string; video?: string; dataChannel?: string },
+        tracks: { audio?: string; video?: string },
         remoteVideo: HTMLVideoElement
     ) {
         const tracksToPull: Array<{
@@ -492,11 +568,8 @@ export default function VideoCall() {
                             () => rej(new Error(`Track with mid ${mid} not received in time`)),
                             10000
                         );
-                        console.log(mid)
                         const handleTrack = (e: RTCTrackEvent) => {
                             const {transceiver, track} = e;
-                            console.log(transceiver.mid)
-                            console.log(String(transceiver.mid) !== String(mid))
                             if (String(transceiver.mid) !== String(mid)) return;
                             remotePeerConnection.removeEventListener('track', handleTrack);
                             res(track);
@@ -599,6 +672,16 @@ export default function VideoCall() {
 
     }
 
+    /**
+     * Joins the call.
+     * Steps:
+     * 1. getUserMedia (audio, video)
+     * 2. createCallsSession (join room)
+     * 3. Create peer connection, add transceivers
+     * 4. Publish tracks to SFU, wait for ICE connected
+     * 5. Publish mute and chat data channels
+     * 6. Connect room WebSocket (sends JOIN_ROOM, receives USER_JOINED/USER_LEFT)
+     */
     async function handleJoinCall() {
         const userToken = getStoredToken();
         if (!userToken) {
@@ -623,15 +706,15 @@ export default function VideoCall() {
             localVideo.srcObject = media;
 
             const mySessionId = await createCallsSession(userToken, true);
-            // const joinRequest: JoinRequest = {
-            //     mediaConstraints: {video: true, audio: true},
-            // }
-            // const mySessionId = await sfuApiService.joinRoom(ROOM_ID, joinRequest);
             mySessionIdRef.current = mySessionId;
 
             const localPeerConnection = createPeerConnection();
             peerConnectionRef.current = localPeerConnection;
 
+            /**
+             * Handles incoming data channels (mute, chat from remote subscribers).
+             * Mute: update remoteMuted state. Chat: handle chat messages and join/leave notifications.
+             */
             localPeerConnection.ondatachannel = (e: RTCDataChannelEvent) => {
                 const ch = e.channel;
                 if (ch.label === MUTE_DATA_CHANNEL_NAME) {
@@ -749,6 +832,7 @@ export default function VideoCall() {
         }
     }
 
+    /** Scroll chat to bottom when new messages arrive. */
     useEffect(() => {
         if (chatMessagesEndRef.current) {
             chatMessagesEndRef.current.scrollIntoView({behavior: 'smooth'});
