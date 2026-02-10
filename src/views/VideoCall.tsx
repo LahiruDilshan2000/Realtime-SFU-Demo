@@ -1,6 +1,6 @@
 /**
- * Video Call - SFU-based WebRTC with WebSocket presence.
- * Flow: Login → Join room → Publish tracks → WebSocket JOIN_ROOM → Receive USER_JOINED/USER_LEFT.
+ * Video Call - SFU-based WebRTC with SSE presence.
+ * Flow: Login → Join room → Publish tracks → SSE connection → Receive ROOM_SNAPSHOT and presence events.
  */
 import {useRef, useState, useEffect} from 'react';
 import {API_CONFIG} from '../constants/api';
@@ -105,7 +105,7 @@ export default function VideoCall() {
     const muteDataChannelRef = useRef<RTCDataChannel | null>(null);
     const chatDataChannelRef = useRef<RTCDataChannel | null>(null);
     const remotePeerConnectionRef = useRef<RTCPeerConnection | null>(null);
-    const roomWsRef = useRef<WebSocket | null>(null);
+    const roomSseAbortControllerRef = useRef<AbortController | null>(null);
     const mutedRef = useRef(false);
     const chatMessagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -155,9 +155,9 @@ export default function VideoCall() {
      * Steps: Clear token → clear API auth → reset all refs/state → stop media tracks.
      */
     function handleLogout() {
-        if (roomWsRef.current) {
-            roomWsRef.current.close();
-            roomWsRef.current = null;
+        if (roomSseAbortControllerRef.current) {
+            roomSseAbortControllerRef.current.abort();
+            roomSseAbortControllerRef.current = null;
         }
         clearToken();
         sfuApiService.clearAuthToken();
@@ -265,12 +265,12 @@ export default function VideoCall() {
 
     /**
      * Cleans up call state and resources.
-     * Steps: Close WebSocket → clear refs → close peer connection → stop tracks → reset state.
+     * Steps: Close SSE connection → clear refs → close peer connection → stop tracks → reset state.
      */
     function doLeaveCleanup() {
-        if (roomWsRef.current) {
-            roomWsRef.current.close();
-            roomWsRef.current = null;
+        if (roomSseAbortControllerRef.current) {
+            roomSseAbortControllerRef.current.abort();
+            roomSseAbortControllerRef.current = null;
         }
         remoteSubscribedSessionIdRef.current = null;
         subscribedSessionIdsRef.current.clear();
@@ -403,85 +403,226 @@ export default function VideoCall() {
     }
 
     /**
-     * Connects to room WebSocket for presence.
-     * Steps: Open WS → onopen send JOIN_ROOM with track info → onmessage handle USER_JOINED/USER_LEFT.
-     * USER_JOINED: subscribe to that user (doRemoteUserFlow). USER_LEFT: cleanup remote.
+     * Connects to room SSE for presence.
+     * Steps:
+     * - Open SSE connection with Bearer token
+     * - Pass sessionId + local track names (video, audio, dataChannel) as query params
+     * - Handle ROOM_SNAPSHOT and presence (USER_JOINED / USER_LEFT) events.
      */
-    function connectRoomWebSocket() {
-        const wsUrl = API_CONFIG.WS_ROOM_URL;
-        if (!wsUrl) {
-            console.warn('WS_ROOM_URL not configured');
+    function connectRoomSSE() {
+        const mySessionId = mySessionIdRef.current;
+        const token = getStoredToken();
+        const localStream = localStreamRef.current;
+
+        if (!mySessionId || !token || !localStream) {
+            console.warn('Cannot connect SSE: missing sessionId, token or local stream');
             return;
         }
-        const ws = new WebSocket(wsUrl);
-        roomWsRef.current = ws;
 
-        ws.onopen = () => {
-            const mySessionId = mySessionIdRef.current;
-            const videoTrack = localStreamRef.current?.getVideoTracks()[0]?.id ?? '';
-            const audioTrack = localStreamRef.current?.getAudioTracks()[0]?.id ?? '';
-            ws.send(JSON.stringify({
-                type: 'JOIN_ROOM',
-                roomToken: ROOM_ID,
-                userId: mySessionId,
-                userName: username || 'User',
-                sessionId: mySessionId,
-                videoTrack,
-                audioTrack,
-                dataChannel: MUTE_DATA_CHANNEL_NAME,
-            }));
-        };
+        const videoTrack = localStream.getVideoTracks()[0]?.id;
+        const audioTrack = localStream.getAudioTracks()[0]?.id;
+        const dataChannel = MUTE_DATA_CHANNEL_NAME;
 
-        ws.onmessage = (event: MessageEvent) => {
-            try {
-                const data = JSON.parse(event.data as string) as {
-                    type?: string;
-                    userId?: string;
-                    userName?: string;
-                    sessionId?: string;
-                    videoTrack?: string;
-                    audioTrack?: string;
-                    dataChannel?: string;
+        if (!videoTrack || !audioTrack) {
+            console.warn('Cannot connect SSE: missing local audio/video track ids');
+            return;
+        }
+
+        const sseUrl =
+            `${API_CONFIG.SSE_BASE_URL}/rooms/${ROOM_ID}` +
+            `?sessionId=${encodeURIComponent(mySessionId)}` +
+            `&video=${encodeURIComponent(videoTrack)}` +
+            `&audio=${encodeURIComponent(audioTrack)}` +
+            `&dataChannel=${encodeURIComponent(dataChannel)}`;
+
+        // Use fetch with ReadableStream to handle SSE with Bearer token
+        const abortController = new AbortController();
+        roomSseAbortControllerRef.current = abortController;
+
+        fetch(sseUrl, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'text/event-stream',
+            },
+            signal: abortController.signal,
+        })
+            .then(async (response) => {
+                if (!response.ok) {
+                    throw new Error(`SSE connection failed: ${response.status}`);
+                }
+
+                const reader = response.body?.getReader();
+                const decoder = new TextDecoder();
+
+                if (!reader) {
+                    throw new Error('No response body reader');
+                }
+
+                let buffer = '';
+                let currentEventName = 'message';
+                let currentEventData = '';
+
+                const processEvent = () => {
+                    if (currentEventData) {
+                        handleSSEEvent(currentEventName, currentEventData);
+                    }
+                    currentEventName = 'message';
+                    currentEventData = '';
                 };
-                if (data.type === 'USER_JOINED' && data.sessionId && data.sessionId !== mySessionIdRef.current) {
-                    const remoteVideo = remoteVideoRef.current;
-                    if (!remoteVideo || subscribedSessionIdsRef.current.has(data.sessionId)) return;
-                    subscribedSessionIdsRef.current.add(data.sessionId);
-                    remoteSubscribedSessionIdRef.current = data.sessionId;
-                    setRemoteParticipantDisplayName(data.userName ?? 'Remote');
-                    const msg = data.userName ? `${data.userName} joined the call` : 'User joined the call';
-                    showNotification(msg, 'join');
-                    doRemoteUserFlow(
-                        data.sessionId,
-                        { audio: data.audioTrack, video: data.videoTrack },
-                        remoteVideo
-                    ).catch((e) => {
-                        subscribedSessionIdsRef.current.delete(data.sessionId!);
-                        remoteSubscribedSessionIdRef.current = null;
-                        console.warn('Subscribe to user failed:', e);
-                    });
-                } else if (data.type === 'USER_LEFT') {
-                    if (data.sessionId) {
-                        subscribedSessionIdsRef.current.delete(data.sessionId);
-                        if (remoteSubscribedSessionIdRef.current === data.sessionId) {
-                            remoteSubscribedSessionIdRef.current = null;
-                            setRemoteParticipantDisplayName('');
-                            const remoteVideo = remoteVideoRef.current;
-                            if (remoteVideo?.srcObject) {
-                                (remoteVideo.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
-                                remoteVideo.srcObject = null;
-                            }
+
+                while (true) {
+                    const { done, value } = await reader.read();
+
+                    if (done) {
+                        // Process any remaining event data
+                        if (currentEventData) {
+                            processEvent();
                         }
-                        showNotification('User left the call', 'leave');
+                        break;
+                    }
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.startsWith('event:')) {
+                            // Process previous event if any
+                            if (currentEventData) {
+                                processEvent();
+                            }
+                            currentEventName = line.substring(6).trim();
+                        } else if (line.startsWith('data:')) {
+                            // Append data (handles multi-line data)
+                            const dataLine = line.substring(5);
+                            if (currentEventData) {
+                                currentEventData += '\n' + dataLine;
+                            } else {
+                                currentEventData = dataLine;
+                            }
+                        } else if (line === '') {
+                            // Empty line indicates end of event
+                            processEvent();
+                        }
                     }
                 }
-            } catch (e) {
-                console.warn('WebSocket message parse error:', e);
-            }
-        };
+            })
+            .catch((error) => {
+                if (error.name !== 'AbortError') {
+                    console.warn('SSE connection error:', error);
+                }
+                roomSseAbortControllerRef.current = null;
+            });
+    }
 
-        ws.onerror = () => console.warn('Room WebSocket error');
-        ws.onclose = () => { roomWsRef.current = null; };
+    /**
+     * Handles SSE events from room presence.
+     * ROOM_SNAPSHOT: initial room data → subscribe to remote participants.
+     * presence: USER_LEFT → cleanup remote user.
+     */
+    function handleSSEEvent(eventName: string, data: string) {
+        try {
+            const payload = JSON.parse(data);
+
+            if (eventName === 'ROOM_SNAPSHOT') {
+                // Handle initial room snapshot
+                const roomData = payload.data;
+                if (roomData?.participants && Array.isArray(roomData.participants)) {
+                    const mySessionId = mySessionIdRef.current;
+                    const remoteVideo = remoteVideoRef.current;
+                    if (!remoteVideo || !mySessionId) return;
+
+                    // Find other participants in call (not myself)
+                    const otherParticipants = roomData.participants.filter(
+                        (p: { sessionId?: string; isInCall?: boolean }) =>
+                            p.sessionId &&
+                            p.sessionId !== mySessionId &&
+                            p.isInCall &&
+                            !subscribedSessionIdsRef.current.has(p.sessionId)
+                    );
+
+                    // Subscribe to first remote participant
+                    for (const participant of otherParticipants) {
+                        const sessionId = participant.sessionId;
+                        if (!sessionId) continue;
+
+                        subscribedSessionIdsRef.current.add(sessionId);
+                        remoteSubscribedSessionIdRef.current = sessionId;
+                        setRemoteParticipantDisplayName(participant.displayName || 'Remote');
+                        const msg = participant.displayName
+                            ? `${participant.displayName} joined the call`
+                            : 'User joined the call';
+                        showNotification(msg, 'join');
+
+                        const tracks = participant.tracks || {};
+                        doRemoteUserFlow(
+                            sessionId,
+                            {
+                                audio: tracks.audio,
+                                video: tracks.video,
+                            },
+                            remoteVideo
+                        ).catch((e) => {
+                            subscribedSessionIdsRef.current.delete(sessionId);
+                            remoteSubscribedSessionIdRef.current = null;
+                            console.warn('Subscribe to user failed:', e);
+                        });
+                        break; // Only subscribe to first remote participant for now
+                    }
+                }
+            } else if (eventName === 'presence') {
+                // Handle presence events (USER_JOINED / USER_LEFT)
+                const mySessionId = mySessionIdRef.current;
+                const remoteVideo = remoteVideoRef.current;
+
+                if (!remoteVideo) return;
+
+                if (payload.type === 'USER_JOINED' && payload.sessionId && payload.sessionId !== mySessionId) {
+                    if (subscribedSessionIdsRef.current.has(payload.sessionId)) return;
+
+                    const sessionId: string = payload.sessionId;
+                    subscribedSessionIdsRef.current.add(sessionId);
+                    remoteSubscribedSessionIdRef.current = sessionId;
+
+                    // USER_JOINED payload now contains: sessionId, video, audio, dataChannel
+                    setRemoteParticipantDisplayName('Remote');
+                    showNotification('User joined the call', 'join');
+
+                    const tracks = {
+                        audio: payload.audio as string | undefined,
+                        video: payload.video as string | undefined,
+                    };
+
+                    doRemoteUserFlow(
+                        sessionId,
+                        {
+                            audio: tracks.audio,
+                            video: tracks.video,
+                        },
+                        remoteVideo
+                    ).catch((e) => {
+                        subscribedSessionIdsRef.current.delete(sessionId);
+                        remoteSubscribedSessionIdRef.current = null;
+                        console.warn('Subscribe to user failed (presence USER_JOINED):', e);
+                    });
+                } else if (payload.type === 'USER_LEFT' && payload.sessionId) {
+                    const sessionId: string = payload.sessionId;
+                    subscribedSessionIdsRef.current.delete(sessionId);
+                    if (remoteSubscribedSessionIdRef.current === sessionId) {
+                        remoteSubscribedSessionIdRef.current = null;
+                        setRemoteParticipantDisplayName('');
+                        if (remoteVideo.srcObject) {
+                            (remoteVideo.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+                            remoteVideo.srcObject = null;
+                        }
+                    }
+                    showNotification('User left the call', 'leave');
+                }
+            }
+        } catch (e) {
+            console.warn('SSE event parse error:', e);
+        }
     }
 
     /**
@@ -546,6 +687,8 @@ export default function VideoCall() {
                 trackName: tracks.video,
             });
         }
+        console.log(tracksToPull)
+        console.log(tracksToPull)
         if (tracksToPull.length === 0) return;
 
         if (!peerConnectionRef.current || !mySessionIdRef.current) return;
@@ -680,7 +823,7 @@ export default function VideoCall() {
      * 3. Create peer connection, add transceivers
      * 4. Publish tracks to SFU, wait for ICE connected
      * 5. Publish mute and chat data channels
-     * 6. Connect room WebSocket (sends JOIN_ROOM, receives USER_JOINED/USER_LEFT)
+     * 6. Connect room SSE (receives ROOM_SNAPSHOT and presence events)
      */
     async function handleJoinCall() {
         const userToken = getStoredToken();
@@ -824,7 +967,7 @@ export default function VideoCall() {
 
             setInCall(true);
 
-            connectRoomWebSocket();
+            connectRoomSSE();
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
         } finally {
@@ -838,6 +981,27 @@ export default function VideoCall() {
             chatMessagesEndRef.current.scrollIntoView({behavior: 'smooth'});
         }
     }, [chatMessages]);
+
+    /**
+     * Cleanup SSE stream when component unmounts (e.g. user closes tab or navigates away).
+     * The browser also aborts fetch on unload, but we explicitly abort to ensure the
+     * backend SseEmitter completes and triggers disconnect logic.
+     */
+    useEffect(() => {
+        const handleBeforeUnload = () => {
+            if (roomSseAbortControllerRef.current) {
+                roomSseAbortControllerRef.current.abort();
+                roomSseAbortControllerRef.current = null;
+            }
+        };
+
+        window.addEventListener('beforeunload', handleBeforeUnload);
+
+        return () => {
+            handleBeforeUnload();
+            window.removeEventListener('beforeunload', handleBeforeUnload);
+        };
+    }, []);
 
     if (!token) {
         return (

@@ -21,35 +21,36 @@ function getBaseUrl(): string {
   return '';
 }
 
-// Helper function to get WebSocket URL dynamically
+// Helper function to get WebSocket URL dynamically for SFU signaling
 // Uses relative URLs when accessed via ngrok (through Vite proxy)
 // Uses localhost URLs when accessed directly on localhost
 function getWebSocketUrl(): string {
   if (typeof window === 'undefined') {
     return 'ws://localhost:1234/webrtc';
   }
-  
+
   const hostname = window.location.hostname;
   const protocol = window.location.protocol;
-  
+
   // If accessing via localhost, use localhost WebSocket directly
   if (hostname === 'localhost' || hostname === '127.0.0.1') {
     return 'ws://localhost:1234/webrtc';
   }
-  
+
   // For ngrok or HTTPS domains, use relative WebSocket URL
   // Vite proxy will forward this to ws://localhost:1234/webrtc
   const wsProtocol = protocol === 'https:' ? 'wss:' : 'ws:';
   return `${wsProtocol}//${hostname}/webrtc`;
 }
 
-// Room presence WebSocket - derives from backend URI (e.g. ws://localhost:8092/ws/room)
-function getRoomWebSocketUrl(): string {
+// SSE base URL (room presence / snapshots)
+function getSseBaseUrl(): string {
   const base = getBaseUrl();
-  if (!base) return '';
-  const wsProtocol = base.startsWith('https') ? 'wss:' : 'ws:';
-  const host = base.replace(/^https?:\/\//, '');
-  return `${wsProtocol}//${host}/ws/room`;
+  if (base) {
+    return `${base}/share-nest/api/v1/sse`;
+  }
+  // When using Vite proxy (ngrok / external host), use relative URL
+  return '/share-nest/api/v1/sse';
 }
 
 // API Configuration Constants
@@ -61,7 +62,7 @@ export const API_CONFIG = {
   STORAGE_TOKEN_KEY: 'auth_token', // JWT token storage key
   TIME_ZONE: 'Asia/Colombo',
   WS_BASE_URL: getWebSocketUrl(),
-  WS_ROOM_URL: getRoomWebSocketUrl(),
+  SSE_BASE_URL: getSseBaseUrl(),
 } as const;
 
 // Cloudflare SFU Configuration
