@@ -1,21 +1,18 @@
 /**
  * User must log in first; token in localStorage.
- * "Join call" runs only local flow (get media, join room, publish).
- * Room info is polled every 5s; when another in-call user with sessionId and
- * audio/video track names is found, remote subscribe flow runs.
- * Join/leave notifications are shown from both: polling (participant diff) and data channel.
+ * Join flow: get media, join room, publish video/audio/data channels.
+ * After publish, connect WebSocket and send JOIN_ROOM with track info.
+ * Backend broadcasts USER_JOINED (existing + new users) and USER_LEFT.
+ * No presence data channel, no getRoomInfo polling.
  */
 import {useRef, useState, useEffect} from 'react';
 import {API_CONFIG} from '../constants/api';
 import sfuApiService from '../services/sfuApiService';
-import type {RoomInfoResponse, EstablishDataChannelsResponse, EstablishDataChannelsRequest} from '../types/sfu';
-import {JoinRequest} from "../types/sfu";
 
 const API_BASE = API_CONFIG.BASE_URL;
 const AUTH_BASE = API_CONFIG.BASE_URL_AUTH;
 const ROOM_ID = 'pmZYT4i4';
 const STORAGE_KEY = API_CONFIG.STORAGE_TOKEN_KEY;
-const ROOM_POLL_INTERVAL_MS = 8000;
 const MUTE_DATA_CHANNEL_NAME = 'mute-signal';
 const CHAT_DATA_CHANNEL_NAME = 'chat';
 
@@ -77,20 +74,6 @@ function createPeerConnection(): RTCPeerConnection {
     });
 }
 
-function findOtherInCallParticipant(
-    roomInfo: RoomInfoResponse,
-    mySessionId: string
-) {
-    const participants = roomInfo.data?.participants ?? [];
-    return participants.find(
-        (p) =>
-            p.sessionId &&
-            p.sessionId !== mySessionId &&
-            p.isInCall &&
-            (p.tracks?.audio || p.tracks?.video)
-    );
-}
-
 export default function VideoCall() {
     const [token, setToken] = useState<string | null>(() => getStoredToken());
     const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -104,11 +87,12 @@ export default function VideoCall() {
     const mySessionIdRef = useRef<string | null>(null);
     const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
     const remoteSubscribedSessionIdRef = useRef<string | null>(null);
-    const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const subscribedSessionIdsRef = useRef<Set<string>>(new Set());
     const localStreamRef = useRef<MediaStream | null>(null);
     const muteDataChannelRef = useRef<RTCDataChannel | null>(null);
     const chatDataChannelRef = useRef<RTCDataChannel | null>(null);
     const remotePeerConnectionRef = useRef<RTCPeerConnection | null>(null);
+    const roomWsRef = useRef<WebSocket | null>(null);
     const mutedRef = useRef(false);
     const chatMessagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -130,7 +114,6 @@ export default function VideoCall() {
         type: 'join' | 'leave';
         timestamp: number
     }>>([]);
-    const previousParticipantsRef = useRef<Set<string>>(new Set());
     const joinNotificationReadyRef = useRef(false);
     const chatDcOpenBeforeReadyRef = useRef(false);
     const [remoteParticipantDisplayName, setRemoteParticipantDisplayName] = useState('');
@@ -151,10 +134,6 @@ export default function VideoCall() {
     }
 
     function handleLogout() {
-        if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current);
-            pollIntervalRef.current = null;
-        }
         clearToken();
         sfuApiService.clearAuthToken();
         setToken(null);
@@ -235,11 +214,6 @@ export default function VideoCall() {
             console.warn('Leave chat:', e);
         }
         doLeaveCleanup();
-        try {
-            await sfuApiService.leaveRoom(ROOM_ID);
-        } catch (e) {
-            console.warn('Leave room:', e);
-        }
     }
 
     async function handleLeaveRoom() {
@@ -253,11 +227,12 @@ export default function VideoCall() {
     }
 
     function doLeaveCleanup() {
-        if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current);
-            pollIntervalRef.current = null;
+        if (roomWsRef.current) {
+            roomWsRef.current.close();
+            roomWsRef.current = null;
         }
         remoteSubscribedSessionIdRef.current = null;
+        subscribedSessionIdsRef.current.clear();
         const pc = peerConnectionRef.current;
         if (pc) {
             pc.close();
@@ -284,46 +259,10 @@ export default function VideoCall() {
         remotePeerConnectionRef.current = null;
         setChatMessages([]);
         setChatInput('');
-        previousParticipantsRef.current.clear();
         joinNotificationReadyRef.current = false;
         chatDcOpenBeforeReadyRef.current = false;
         setNotifications([]);
         setRemoteParticipantDisplayName('');
-    }
-
-    async function establishDataChannelTransport(
-        pc: RTCPeerConnection,
-        sessionId: string
-    ) {
-        const dc = pc.createDataChannel('server-events', {negotiated: false});
-        dc.onmessage = (m) => console.log('Server event:', m);
-        const hasLocalDescription = pc.localDescription != null;
-        let request: EstablishDataChannelsRequest = {
-            dataChannel: {location: 'remote', dataChannelName: 'server-events'},
-        };
-        if (!hasLocalDescription) {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            request.sessionDescription = {type: 'offer', sdp: offer.sdp};
-        }
-        const response = await sfuApiService.establishDataChannels(sessionId, request);
-        const respData = (response as {
-            data?: EstablishDataChannelsResponse
-        }).data || response as EstablishDataChannelsResponse;
-        if (respData.requiresImmediateRenegotiation && respData.sessionDescription) {
-            await pc.setRemoteDescription(
-                new RTCSessionDescription(respData.sessionDescription)
-            );
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            await sfuApiService.renegotiate(sessionId, {
-                sessionDescription: {sdp: answer.sdp, type: 'answer'},
-            });
-        } else if (respData.sessionDescription) {
-            await pc.setRemoteDescription(
-                new RTCSessionDescription(respData.sessionDescription)
-            );
-        }
     }
 
     async function establishAndPublishMuteDataChannel(
@@ -372,6 +311,9 @@ export default function VideoCall() {
     }
 
     function showNotification(message: string, type: 'join' | 'leave') {
+        if (type === 'join') {
+            console.log('[Notification] Showing user joined:', message);
+        }
         const id = `notif-${Date.now()}-${Math.random()}`;
         setNotifications((prev) => [...prev, {id, message, type, timestamp: Date.now()}]);
         setTimeout(() => {
@@ -400,6 +342,83 @@ export default function VideoCall() {
         const dc = chatDataChannelRef.current;
         if (!dc || dc.readyState !== 'open') return;
         sendNotificationEvent('join', 'User');
+    }
+
+    function connectRoomWebSocket() {
+        const wsUrl = API_CONFIG.WS_ROOM_URL;
+        if (!wsUrl) {
+            console.warn('WS_ROOM_URL not configured');
+            return;
+        }
+        const ws = new WebSocket(wsUrl);
+        roomWsRef.current = ws;
+
+        ws.onopen = () => {
+            const mySessionId = mySessionIdRef.current;
+            const videoTrack = localStreamRef.current?.getVideoTracks()[0]?.id ?? '';
+            const audioTrack = localStreamRef.current?.getAudioTracks()[0]?.id ?? '';
+            ws.send(JSON.stringify({
+                type: 'JOIN_ROOM',
+                roomToken: ROOM_ID,
+                userId: mySessionId,
+                userName: username || 'User',
+                sessionId: mySessionId,
+                videoTrack,
+                audioTrack,
+                dataChannel: MUTE_DATA_CHANNEL_NAME,
+            }));
+        };
+
+        ws.onmessage = (event: MessageEvent) => {
+            try {
+                const data = JSON.parse(event.data as string) as {
+                    type?: string;
+                    userId?: string;
+                    userName?: string;
+                    sessionId?: string;
+                    videoTrack?: string;
+                    audioTrack?: string;
+                    dataChannel?: string;
+                };
+                if (data.type === 'USER_JOINED' && data.sessionId && data.sessionId !== mySessionIdRef.current) {
+                    const remoteVideo = remoteVideoRef.current;
+                    if (!remoteVideo || subscribedSessionIdsRef.current.has(data.sessionId)) return;
+                    subscribedSessionIdsRef.current.add(data.sessionId);
+                    remoteSubscribedSessionIdRef.current = data.sessionId;
+                    setRemoteParticipantDisplayName(data.userName ?? 'Remote');
+                    const msg = data.userName ? `${data.userName} joined the call` : 'User joined the call';
+                    showNotification(msg, 'join');
+                    doRemoteUserFlow(
+                        data.sessionId,
+                        { audio: data.audioTrack, video: data.videoTrack },
+                        remoteVideo
+                    ).catch((e) => {
+                        subscribedSessionIdsRef.current.delete(data.sessionId!);
+                        remoteSubscribedSessionIdRef.current = null;
+                        console.warn('Subscribe to user failed:', e);
+                    });
+                } else if (data.type === 'USER_LEFT') {
+                    if (data.sessionId) {
+                        subscribedSessionIdsRef.current.delete(data.sessionId);
+                        if (remoteSubscribedSessionIdRef.current === data.sessionId) {
+                            remoteSubscribedSessionIdRef.current = null;
+                            setRemoteParticipantDisplayName('');
+                            const remoteVideo = remoteVideoRef.current;
+                            if (remoteVideo?.srcObject) {
+                                (remoteVideo.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+                                remoteVideo.srcObject = null;
+                            }
+                        }
+                        showNotification('User left the call', 'leave');
+                    }
+                }
+            } catch (e) {
+                console.warn('WebSocket message parse error:', e);
+            }
+        };
+
+        ws.onerror = () => console.warn('Room WebSocket error');
+        ws.onclose = () => { roomWsRef.current = null; };
     }
 
     function handleSendChatMessage() {
@@ -577,6 +596,7 @@ export default function VideoCall() {
                 }
             };
         }
+
     }
 
     async function handleJoinCall() {
@@ -704,10 +724,6 @@ export default function VideoCall() {
             );
             await connected;
 
-            await establishDataChannelTransport(localPeerConnection, mySessionId).catch((e) =>
-                console.warn('Data channel transport setup:', e)
-            );
-
             await establishAndPublishMuteDataChannel(
                 localPeerConnection,
                 mySessionId
@@ -724,6 +740,8 @@ export default function VideoCall() {
             }
 
             setInCall(true);
+
+            connectRoomWebSocket();
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
         } finally {
@@ -736,73 +754,6 @@ export default function VideoCall() {
             chatMessagesEndRef.current.scrollIntoView({behavior: 'smooth'});
         }
     }, [chatMessages]);
-
-    useEffect(() => {
-        if (!inCall) return;
-
-        const poll = async () => {
-            const mySessionId = mySessionIdRef.current;
-            const remoteVideo = remoteVideoRef.current;
-            const userToken = getStoredToken();
-            if (
-                !mySessionId ||
-                !remoteVideo ||
-                !userToken ||
-                remoteSubscribedSessionIdRef.current
-            ) {
-                return;
-            }
-
-            try {
-                const roomInfo = await sfuApiService.getRoomInfo(ROOM_ID);
-                const currentParticipants = new Set(
-                    roomInfo.data?.participants
-                        ?.filter((p) => p.isInCall && p.sessionId)
-                        .map((p) => p.sessionId!) ?? []
-                );
-                const previousParticipants = previousParticipantsRef.current;
-                currentParticipants.forEach((sessionId) => {
-                    if (!previousParticipants.has(sessionId) && sessionId !== mySessionId) {
-                        showNotification('User joined the call', 'join');
-                    }
-                });
-                previousParticipants.forEach((sessionId) => {
-                    if (!currentParticipants.has(sessionId) && sessionId !== mySessionId) {
-                        showNotification('User left the call', 'leave');
-                    }
-                });
-                previousParticipantsRef.current = currentParticipants;
-
-                const other = findOtherInCallParticipant(roomInfo, mySessionId);
-                if (!other?.sessionId || !other.tracks) return;
-                if (remoteSubscribedSessionIdRef.current === other.sessionId) return;
-
-                remoteSubscribedSessionIdRef.current = other.sessionId;
-                setRemoteParticipantDisplayName(other.displayName ?? 'Remote');
-                await doRemoteUserFlow(
-                    other.sessionId,
-                    other.tracks,
-                    remoteVideo
-                );
-                if (pollIntervalRef.current) {
-                    clearInterval(pollIntervalRef.current);
-                    pollIntervalRef.current = null;
-                }
-            } catch {
-                // ignore poll errors
-            }
-        };
-
-        pollIntervalRef.current = setInterval(poll, ROOM_POLL_INTERVAL_MS);
-        poll();
-
-        return () => {
-            if (pollIntervalRef.current) {
-                clearInterval(pollIntervalRef.current);
-                pollIntervalRef.current = null;
-            }
-        };
-    }, [inCall]);
 
     if (!token) {
         return (

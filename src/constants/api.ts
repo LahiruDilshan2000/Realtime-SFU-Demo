@@ -43,6 +43,15 @@ function getWebSocketUrl(): string {
   return `${wsProtocol}//${hostname}/webrtc`;
 }
 
+// Room presence WebSocket - derives from backend URI (e.g. ws://localhost:8092/ws/room)
+function getRoomWebSocketUrl(): string {
+  const base = getBaseUrl();
+  if (!base) return '';
+  const wsProtocol = base.startsWith('https') ? 'wss:' : 'ws:';
+  const host = base.replace(/^https?:\/\//, '');
+  return `${wsProtocol}//${host}/ws/room`;
+}
+
 // API Configuration Constants
 export const API_CONFIG = {
   /** Backend base URI (e.g. http://localhost:8092) */
@@ -51,8 +60,8 @@ export const API_CONFIG = {
   BASE_URL_AUTH: getBaseUrl() ? `${getBaseUrl()}/share-nest/api/v1/auth` : '/share-nest/api/v1/auth',
   STORAGE_TOKEN_KEY: 'auth_token', // JWT token storage key
   TIME_ZONE: 'Asia/Colombo',
-  // Not used: video call uses only Java backend APIs + getRoomInfo polling (no Node/WebSocket server)
   WS_BASE_URL: getWebSocketUrl(),
+  WS_ROOM_URL: getRoomWebSocketUrl(),
 } as const;
 
 // Cloudflare SFU Configuration
