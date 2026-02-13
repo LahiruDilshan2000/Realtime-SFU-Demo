@@ -1,5 +1,6 @@
 // Backend base URI (Java backend)
-const BACKEND_URI = 'http://localhost:8092';
+// const BACKEND_URI = 'http://localhost:8092';
+const BACKEND_URI = 'https://test-service.sharenest.io';
 
 // Helper function to get the base URL dynamically
 // Uses relative URLs when accessed via ngrok (through Vite proxy)
@@ -28,15 +29,15 @@ function getWebSocketUrl(): string {
   if (typeof window === 'undefined') {
     return 'ws://localhost:1234/webrtc';
   }
-  
+
   const hostname = window.location.hostname;
   const protocol = window.location.protocol;
-  
+
   // If accessing via localhost, use localhost WebSocket directly
   if (hostname === 'localhost' || hostname === '127.0.0.1') {
     return 'ws://localhost:1234/webrtc';
   }
-  
+
   // For ngrok or HTTPS domains, use relative WebSocket URL
   // Vite proxy will forward this to ws://localhost:1234/webrtc
   const wsProtocol = protocol === 'https:' ? 'wss:' : 'ws:';
@@ -71,7 +72,7 @@ export const SFU_CONFIG = {
   // CRITICAL: When iceTransportPolicy: 'relay' is set, browser MUST have TURN servers in iceServers
   // Cloudflare Calls API handles TURN server-side, but browser still needs TURN servers configured
   // to get relay candidates. Without TURN servers, you'll see "No relay candidates" error.
-  // 
+  //
   // Free public TURN servers (for testing) - Metered.ca Open Relay:
   // - 20 GB/month free
   // - Ports 80/443 (bypasses firewalls)
@@ -89,7 +90,7 @@ export const SFU_CONFIG = {
   // Set to 'relay' to force media through TURN servers (bypasses UDP blocking)
   // Set to 'all' (default) to allow direct peer-to-peer when possible
   // Use 'relay' if UDP traffic is blocked but TCP/TLS works (data channels work but media doesn't)
-  // 
+  //
   // NOTE: If TURN servers are not accessible, 'relay' mode will fail.
   // Try 'all' first - Cloudflare's SFU may provide TURN server-side.
   // Only use 'relay' if you have working TURN servers configured.

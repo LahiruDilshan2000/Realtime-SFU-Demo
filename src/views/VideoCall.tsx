@@ -408,11 +408,15 @@ export default function VideoCall() {
      * USER_JOINED: subscribe to that user (doRemoteUserFlow). USER_LEFT: cleanup remote.
      */
     function connectRoomWebSocket() {
-        const wsUrl = API_CONFIG.WS_ROOM_URL;
+
+        const userToken = getStoredToken();
+        const wsUrl = API_CONFIG.WS_ROOM_URL + `?token=${userToken}`;
+        console.log(wsUrl)
         if (!wsUrl) {
             console.warn('WS_ROOM_URL not configured');
             return;
         }
+
         const ws = new WebSocket(wsUrl);
         roomWsRef.current = ws;
 
@@ -420,6 +424,7 @@ export default function VideoCall() {
             const mySessionId = mySessionIdRef.current;
             const videoTrack = localStreamRef.current?.getVideoTracks()[0]?.id ?? '';
             const audioTrack = localStreamRef.current?.getAudioTracks()[0]?.id ?? '';
+            console.log(username)
             ws.send(JSON.stringify({
                 type: 'JOIN_ROOM',
                 roomToken: ROOM_ID,
