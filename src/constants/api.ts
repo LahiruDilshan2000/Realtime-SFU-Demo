@@ -58,8 +58,10 @@ function getRoomWebSocketUrl(): string {
 export const API_CONFIG = {
   /** Backend base URI (e.g. http://localhost:8092) */
   BACKEND_URI,
-  BASE_URL: getBaseUrl() ? `${getBaseUrl()}/share-nest/api/v1/talk` : '/share-nest/api/v1/talk',
-  BASE_URL_AUTH: getBaseUrl() ? `${getBaseUrl()}/share-nest/api/v1/auth` : '/share-nest/api/v1/auth',
+  // BASE_URL: getBaseUrl() ? `${getBaseUrl()}/share-nest/api/v1/talk` : '/share-nest/api/v1/talk',
+  // BASE_URL_AUTH: getBaseUrl() ? `${getBaseUrl()}/share-nest/api/v1/auth` : '/share-nest/api/v1/auth',
+  BASE_URL_AUTH: `${BACKEND_URI}/share-nest/api/v1/auth`,
+  BASE_URL: `${BACKEND_URI}/share-nest/api/v1/talk`,
   STORAGE_TOKEN_KEY: 'auth_token', // JWT token storage key
   TIME_ZONE: 'Asia/Colombo',
   WS_BASE_URL: getWebSocketUrl(),

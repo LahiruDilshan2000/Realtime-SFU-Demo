@@ -116,6 +116,13 @@ export default function VideoCall() {
     const chatMessagesEndRef = useRef<HTMLDivElement>(null);
     const remoteParticipantsRef = useRef<Map<string, RemoteParticipant>>(new Map());
     const remoteVideoRefsRef = useRef<Map<string, React.RefObject<HTMLVideoElement>>>(new Map());
+    const subscriptionQueueRef = useRef<Array<{
+        sessionId: string;
+        displayName: string;
+        tracks: { audio?: string; video?: string };
+        videoRef: React.RefObject<HTMLVideoElement>;
+    }>>([]);
+    const isProcessingQueueRef = useRef(false);
 
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
@@ -193,6 +200,8 @@ export default function VideoCall() {
         });
         remoteParticipantsRef.current.clear();
         remoteVideoRefsRef.current.clear();
+        subscriptionQueueRef.current = [];
+        isProcessingQueueRef.current = false;
         setRemoteParticipants(new Map());
     }
 
@@ -307,6 +316,8 @@ export default function VideoCall() {
         });
         remoteParticipantsRef.current.clear();
         remoteVideoRefsRef.current.clear();
+        subscriptionQueueRef.current = [];
+        isProcessingQueueRef.current = false;
         setRemoteParticipants(new Map());
         setInCall(false);
         setMuted(false);
@@ -423,9 +434,8 @@ export default function VideoCall() {
     function connectRoomWebSocket() {
 
         const userToken = getStoredToken();
-        const wsUrl = API_CONFIG.WS_ROOM_URL + `?token=${userToken}`;
-        // const wsUrl = `ws://localhost:8092/ws/room?token=${userTokgit en}`;
-        // const wsUrl = `wss://acrobatic-trinh-nonodorous.ngrok-free.dev/ws/room?token=${userToken}`;
+        // const wsUrl = API_CONFIG.WS_ROOM_URL + `?token=${userToken}`;
+        const wsUrl = `wss://test-service.sharenest.io/ws/room?token=${userToken}`;
         console.log("----------------------------")
         console.log(wsUrl)
         if (!wsUrl) {
@@ -486,18 +496,16 @@ export default function VideoCall() {
                     remoteParticipantsRef.current.set(data.sessionId, participant);
                     setRemoteParticipants(new Map(remoteParticipantsRef.current));
 
-                    // Subscribe to this user's tracks
-                    doRemoteUserFlow(
-                        data.sessionId,
-                        { audio: data.audioTrack, video: data.videoTrack },
-                        videoRef
-                    ).catch((e) => {
-                        subscribedSessionIdsRef.current.delete(data.sessionId!);
-                        remoteParticipantsRef.current.delete(data.sessionId!);
-                        remoteVideoRefsRef.current.delete(data.sessionId!);
-                        setRemoteParticipants(new Map(remoteParticipantsRef.current));
-                        console.warn('Subscribe to user failed:', e);
+                    // Add to subscription queue instead of calling directly
+                    subscriptionQueueRef.current.push({
+                        sessionId: data.sessionId,
+                        displayName,
+                        tracks: { audio: data.audioTrack, video: data.videoTrack },
+                        videoRef,
                     });
+
+                    // Process queue (will only start if not already processing)
+                    processSubscriptionQueue();
                 } else if (data.type === 'USER_LEFT') {
                     if (data.sessionId) {
                         subscribedSessionIdsRef.current.delete(data.sessionId);
@@ -551,6 +559,39 @@ export default function VideoCall() {
         } catch (e) {
             console.warn('Send chat message:', e);
         }
+    }
+
+    /**
+     * Processes the subscription queue one by one.
+     * Each user's flow: subscribe tracks → renegotiate if needed → subscribe data channels → next user
+     */
+    async function processSubscriptionQueue() {
+        if (isProcessingQueueRef.current) return;
+        if (subscriptionQueueRef.current.length === 0) return;
+
+        isProcessingQueueRef.current = true;
+
+        while (subscriptionQueueRef.current.length > 0) {
+            const nextUser = subscriptionQueueRef.current.shift();
+            if (!nextUser) break;
+
+            try {
+                await doRemoteUserFlow(
+                    nextUser.sessionId,
+                    nextUser.tracks,
+                    nextUser.videoRef
+                );
+            } catch (e) {
+                console.warn(`Subscribe to user ${nextUser.sessionId} failed:`, e);
+                // Clean up on error
+                subscribedSessionIdsRef.current.delete(nextUser.sessionId);
+                remoteParticipantsRef.current.delete(nextUser.sessionId);
+                remoteVideoRefsRef.current.delete(nextUser.sessionId);
+                setRemoteParticipants(new Map(remoteParticipantsRef.current));
+            }
+        }
+
+        isProcessingQueueRef.current = false;
     }
 
     /**
