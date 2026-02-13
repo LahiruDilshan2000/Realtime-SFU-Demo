@@ -1,7 +1,7 @@
 // Backend base URI (Java backend)
-const BACKEND_URI = 'http://localhost:8092';
+// const BACKEND_URI = 'http://localhost:8092';
 // const BACKEND_URI = 'https://acrobatic-trinh-nonodorous.ngrok-free.dev';
-// const BACKEND_URI = 'https://test-service.sharenest.io';
+const BACKEND_URI = 'https://test-service.sharenest.io';
 
 // Helper function to get the base URL dynamically
 // Uses relative URLs when accessed via ngrok (through Vite proxy)
