@@ -8,8 +8,8 @@ import sfuApiService from '../services/sfuApiService';
 
 const API_BASE = API_CONFIG.BASE_URL;
 const AUTH_BASE = API_CONFIG.BASE_URL_AUTH;
-// const ROOM_ID = 'pmZYT4i4';
-const ROOM_ID = '0GYwPJut';
+// const ROOM_ID = '0GYwPJut';
+const ROOM_ID = 'liuVr5EO';
 const STORAGE_KEY = API_CONFIG.STORAGE_TOKEN_KEY;
 const MUTE_DATA_CHANNEL_NAME = 'mute-signal';
 const CHAT_DATA_CHANNEL_NAME = 'chat';
