@@ -2,13 +2,14 @@
  * Video Call - SFU-based WebRTC with WebSocket presence.
  * Flow: Login → Join room → Publish tracks → WebSocket JOIN_ROOM → Receive USER_JOINED/USER_LEFT.
  */
-import {useRef, useState, useEffect} from 'react';
+import {useRef, useState, useEffect, createRef} from 'react';
 import {API_CONFIG} from '../constants/api';
 import sfuApiService from '../services/sfuApiService';
 
 const API_BASE = API_CONFIG.BASE_URL;
 const AUTH_BASE = API_CONFIG.BASE_URL_AUTH;
-const ROOM_ID = 'pmZYT4i4';
+// const ROOM_ID = 'pmZYT4i4';
+const ROOM_ID = '0GYwPJut';
 const STORAGE_KEY = API_CONFIG.STORAGE_TOKEN_KEY;
 const MUTE_DATA_CHANNEL_NAME = 'mute-signal';
 const CHAT_DATA_CHANNEL_NAME = 'chat';
@@ -87,10 +88,16 @@ function createPeerConnection(): RTCPeerConnection {
     });
 }
 
+interface RemoteParticipant {
+    sessionId: string;
+    displayName: string;
+    muted: boolean;
+    videoRef: React.RefObject<HTMLVideoElement>;
+}
+
 export default function VideoCall() {
     const [token, setToken] = useState<string | null>(() => getStoredToken());
     const localVideoRef = useRef<HTMLVideoElement>(null);
-    const remoteVideoRef = useRef<HTMLVideoElement>(null);
     const [error, setError] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     const [loginLoading, setLoginLoading] = useState(false);
@@ -99,20 +106,20 @@ export default function VideoCall() {
 
     const mySessionIdRef = useRef<string | null>(null);
     const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-    const remoteSubscribedSessionIdRef = useRef<string | null>(null);
+    const remotePeerConnectionRef = useRef<RTCPeerConnection | null>(null);
     const subscribedSessionIdsRef = useRef<Set<string>>(new Set());
     const localStreamRef = useRef<MediaStream | null>(null);
     const muteDataChannelRef = useRef<RTCDataChannel | null>(null);
     const chatDataChannelRef = useRef<RTCDataChannel | null>(null);
-    const remotePeerConnectionRef = useRef<RTCPeerConnection | null>(null);
     const roomWsRef = useRef<WebSocket | null>(null);
     const mutedRef = useRef(false);
     const chatMessagesEndRef = useRef<HTMLDivElement>(null);
+    const remoteParticipantsRef = useRef<Map<string, RemoteParticipant>>(new Map());
+    const remoteVideoRefsRef = useRef<Map<string, React.RefObject<HTMLVideoElement>>>(new Map());
 
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
     const [muted, setMuted] = useState(false);
-    const [remoteMuted, setRemoteMuted] = useState(false);
     const [chatOpen, setChatOpen] = useState(false);
     const [chatMessages, setChatMessages] = useState<Array<{
         id: string;
@@ -127,9 +134,9 @@ export default function VideoCall() {
         type: 'join' | 'leave';
         timestamp: number
     }>>([]);
+    const [remoteParticipants, setRemoteParticipants] = useState<Map<string, RemoteParticipant>>(new Map());
     const joinNotificationReadyRef = useRef(false);
     const chatDcOpenBeforeReadyRef = useRef(false);
-    const [remoteParticipantDisplayName, setRemoteParticipantDisplayName] = useState('');
 
     /**
      * Handles login form submit.
@@ -166,24 +173,27 @@ export default function VideoCall() {
         setError(null);
         mySessionIdRef.current = null;
         peerConnectionRef.current = null;
-        remoteSubscribedSessionIdRef.current = null;
         localStreamRef.current = null;
         muteDataChannelRef.current = null;
         chatDataChannelRef.current = null;
-        remotePeerConnectionRef.current = null;
-        setRemoteMuted(false);
-        setRemoteParticipantDisplayName('');
         setChatMessages([]);
         setChatInput('');
         const localVideo = localVideoRef.current;
-        const remoteVideo = remoteVideoRef.current;
         if (localVideo?.srcObject) {
             (localVideo.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
             localVideo.srcObject = null;
         }
-        if (remoteVideo?.srcObject) {
-            remoteVideo.srcObject = null;
-        }
+        // Clean up all remote participants
+        remoteParticipantsRef.current.forEach((participant) => {
+            const video = participant.videoRef.current;
+            if (video?.srcObject) {
+                (video.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+                video.srcObject = null;
+            }
+        });
+        remoteParticipantsRef.current.clear();
+        remoteVideoRefsRef.current.clear();
+        setRemoteParticipants(new Map());
     }
 
     /**
@@ -272,7 +282,6 @@ export default function VideoCall() {
             roomWsRef.current.close();
             roomWsRef.current = null;
         }
-        remoteSubscribedSessionIdRef.current = null;
         subscribedSessionIdsRef.current.clear();
         const pc = peerConnectionRef.current;
         if (pc) {
@@ -281,7 +290,6 @@ export default function VideoCall() {
         }
         mySessionIdRef.current = null;
         const localVideo = localVideoRef.current;
-        const remoteVideo = remoteVideoRef.current;
         if (localStreamRef.current) {
             localStreamRef.current.getTracks().forEach((t) => t.stop());
             localStreamRef.current = null;
@@ -289,21 +297,26 @@ export default function VideoCall() {
         if (localVideo?.srcObject) {
             localVideo.srcObject = null;
         }
-        if (remoteVideo?.srcObject) {
-            remoteVideo.srcObject = null;
-        }
+        // Clean up all remote participants
+        remoteParticipantsRef.current.forEach((participant) => {
+            const video = participant.videoRef.current;
+            if (video?.srcObject) {
+                (video.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+                video.srcObject = null;
+            }
+        });
+        remoteParticipantsRef.current.clear();
+        remoteVideoRefsRef.current.clear();
+        setRemoteParticipants(new Map());
         setInCall(false);
         setMuted(false);
-        setRemoteMuted(false);
         muteDataChannelRef.current = null;
         chatDataChannelRef.current = null;
-        remotePeerConnectionRef.current = null;
         setChatMessages([]);
         setChatInput('');
         joinNotificationReadyRef.current = false;
         chatDcOpenBeforeReadyRef.current = false;
         setNotifications([]);
-        setRemoteParticipantDisplayName('');
     }
 
     /**
@@ -411,6 +424,9 @@ export default function VideoCall() {
 
         const userToken = getStoredToken();
         const wsUrl = API_CONFIG.WS_ROOM_URL + `?token=${userToken}`;
+        // const wsUrl = `ws://localhost:8092/ws/room?token=${userTokgit en}`;
+        // const wsUrl = `wss://acrobatic-trinh-nonodorous.ngrok-free.dev/ws/room?token=${userToken}`;
+        console.log("----------------------------")
         console.log(wsUrl)
         if (!wsUrl) {
             console.warn('WS_ROOM_URL not configured');
@@ -449,35 +465,54 @@ export default function VideoCall() {
                     dataChannel?: string;
                 };
                 if (data.type === 'USER_JOINED' && data.sessionId && data.sessionId !== mySessionIdRef.current) {
-                    const remoteVideo = remoteVideoRef.current;
-                    if (!remoteVideo || subscribedSessionIdsRef.current.has(data.sessionId)) return;
+                    if (subscribedSessionIdsRef.current.has(data.sessionId)) return;
                     subscribedSessionIdsRef.current.add(data.sessionId);
-                    remoteSubscribedSessionIdRef.current = data.sessionId;
-                    setRemoteParticipantDisplayName(data.userName ?? 'Remote');
-                    const msg = data.userName ? `${data.userName} joined the call` : 'User joined the call';
+
+                    // Create a new video ref for this participant
+                    const videoRef = createRef<HTMLVideoElement>();
+                    remoteVideoRefsRef.current.set(data.sessionId, videoRef);
+
+                    const displayName = data.userName ?? 'User';
+                    const msg = `${displayName} joined the call`;
                     showNotification(msg, 'join');
+
+                    // Create participant entry
+                    const participant: RemoteParticipant = {
+                        sessionId: data.sessionId,
+                        displayName,
+                        muted: false,
+                        videoRef,
+                    };
+                    remoteParticipantsRef.current.set(data.sessionId, participant);
+                    setRemoteParticipants(new Map(remoteParticipantsRef.current));
+
+                    // Subscribe to this user's tracks
                     doRemoteUserFlow(
                         data.sessionId,
                         { audio: data.audioTrack, video: data.videoTrack },
-                        remoteVideo
+                        videoRef
                     ).catch((e) => {
                         subscribedSessionIdsRef.current.delete(data.sessionId!);
-                        remoteSubscribedSessionIdRef.current = null;
+                        remoteParticipantsRef.current.delete(data.sessionId!);
+                        remoteVideoRefsRef.current.delete(data.sessionId!);
+                        setRemoteParticipants(new Map(remoteParticipantsRef.current));
                         console.warn('Subscribe to user failed:', e);
                     });
                 } else if (data.type === 'USER_LEFT') {
                     if (data.sessionId) {
                         subscribedSessionIdsRef.current.delete(data.sessionId);
-                        if (remoteSubscribedSessionIdRef.current === data.sessionId) {
-                            remoteSubscribedSessionIdRef.current = null;
-                            setRemoteParticipantDisplayName('');
-                            const remoteVideo = remoteVideoRef.current;
-                            if (remoteVideo?.srcObject) {
-                                (remoteVideo.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
-                                remoteVideo.srcObject = null;
+                        const participant = remoteParticipantsRef.current.get(data.sessionId);
+                        if (participant) {
+                            const video = participant.videoRef.current;
+                            if (video?.srcObject) {
+                                (video.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+                                video.srcObject = null;
                             }
+                            remoteParticipantsRef.current.delete(data.sessionId);
+                            remoteVideoRefsRef.current.delete(data.sessionId);
+                            setRemoteParticipants(new Map(remoteParticipantsRef.current));
+                            showNotification(`${participant.displayName} left the call`, 'leave');
                         }
-                        showNotification('User left the call', 'leave');
                     }
                 }
             } catch (e) {
@@ -530,7 +565,7 @@ export default function VideoCall() {
     async function doRemoteUserFlow(
         otherSessionId: string,
         tracks: { audio?: string; video?: string },
-        remoteVideo: HTMLVideoElement
+        remoteVideoRef: React.RefObject<HTMLVideoElement>
     ) {
         const tracksToPull: Array<{
             location: 'remote';
@@ -600,8 +635,22 @@ export default function VideoCall() {
 
         const pulledTracks = await resolvingTracks;
         const remoteVideoStream = new MediaStream();
-        remoteVideo.srcObject = remoteVideoStream;
         pulledTracks.forEach((t) => remoteVideoStream.addTrack(t));
+
+        // Wait for video element to be available (React may not have rendered it yet)
+        let videoElement = remoteVideoRef.current;
+        let attempts = 0;
+        while (!videoElement && attempts < 10) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            videoElement = remoteVideoRef.current;
+            attempts++;
+        }
+
+        if (videoElement) {
+            videoElement.srcObject = remoteVideoStream;
+        } else {
+            console.warn(`Video element not available for participant ${otherSessionId}`);
+        }
 
         const muteDcResponse = await sfuApiService.subscribeDataChannels(mySessionId, {
             dataChannels: [
@@ -621,7 +670,13 @@ export default function VideoCall() {
             muteDc.onmessage = (ev: MessageEvent) => {
                 try {
                     const {muted} = JSON.parse(ev.data as string) as { muted?: boolean };
-                    if (typeof muted === 'boolean') setRemoteMuted(muted);
+                    if (typeof muted === 'boolean') {
+                        const participant = remoteParticipantsRef.current.get(otherSessionId);
+                        if (participant) {
+                            participant.muted = muted;
+                            setRemoteParticipants(new Map(remoteParticipantsRef.current));
+                        }
+                    }
                 } catch (_) {
                 }
             };
@@ -695,12 +750,10 @@ export default function VideoCall() {
         }
 
         const localVideo = localVideoRef.current;
-        const remoteVideo = remoteVideoRef.current;
-        if (!localVideo || !remoteVideo) return;
+        if (!localVideo) return;
 
         setError(null);
         setLoading(true);
-        remoteSubscribedSessionIdRef.current = null;
 
         try {
             const media = await navigator.mediaDevices.getUserMedia({
@@ -717,20 +770,13 @@ export default function VideoCall() {
             peerConnectionRef.current = localPeerConnection;
 
             /**
-             * Handles incoming data channels (mute, chat from remote subscribers).
-             * Mute: update remoteMuted state. Chat: handle chat messages and join/leave notifications.
+             * Handles incoming data channels (chat from remote subscribers).
+             * Chat: handle chat messages and join/leave notifications.
+             * Note: Mute state is handled per-participant in doRemoteUserFlow.
              */
             localPeerConnection.ondatachannel = (e: RTCDataChannelEvent) => {
                 const ch = e.channel;
-                if (ch.label === MUTE_DATA_CHANNEL_NAME) {
-                    ch.onmessage = (ev: MessageEvent) => {
-                        try {
-                            const {muted} = JSON.parse(ev.data as string) as { muted?: boolean };
-                            if (typeof muted === 'boolean') setRemoteMuted(muted);
-                        } catch (_) {
-                        }
-                    };
-                } else if (ch.label === CHAT_DATA_CHANNEL_NAME || ch.label === `${CHAT_DATA_CHANNEL_NAME}-subscribed`) {
+                if (ch.label === CHAT_DATA_CHANNEL_NAME || ch.label === `${CHAT_DATA_CHANNEL_NAME}-subscribed`) {
                     ch.onmessage = (ev: MessageEvent) => {
                         try {
                             const data = JSON.parse(ev.data as string) as {
@@ -919,51 +965,58 @@ export default function VideoCall() {
                     Logout
                 </button>
             </div>
-            <div
-                className={`grid gap-4 px-4 flex-1 ${chatOpen ? 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)_320px] max-lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]' : 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)]'} max-sm:grid-cols-1`}>
-                <div className="relative">
-                    <h2 className="text-base font-normal mb-2">Local stream</h2>
-                    <div className="relative w-full bg-black rounded-lg">
-                        <video
-                            ref={localVideoRef}
-                            autoPlay
-                            playsInline
-                            muted
-                            className="w-full bg-black rounded-lg"
-                        />
-                        <span
-                            className="absolute bottom-2 right-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">
-                            You
-                        </span>
-                    </div>
-                </div>
-                <div className="relative">
-                    <h2 className="text-base font-normal mb-2">Remote stream</h2>
-                    <div className="relative w-full bg-black rounded-lg">
-                        <video
-                            ref={remoteVideoRef}
-                            autoPlay
-                            playsInline
-                            className="w-full rounded-lg"
-                        />
-                        <span
-                            className="absolute bottom-2 right-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">
-                            {remoteParticipantDisplayName || 'Remote'}
-                        </span>
-                        {remoteMuted && (
-                            <div
-                                className="absolute inset-0 flex items-center justify-center bg-black/40 rounded-lg pointer-events-none"
-                                aria-hidden
-                            >
-                                <span className="rounded-full bg-red-500/90 p-2" title="Remote muted">
-                                    <svg className="w-6 h-6 text-white" fill="currentColor" viewBox="0 0 24 24"
-                                         aria-hidden>
-                                        <path
-                                            d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.2 14.47 16 12 16s-4.52-1.8-4.93-4.15c-.08-.49-.49-.85-.98-.85-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V20c0 .55.45 1 1 1s1-.45 1-1v-2.08c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/>
-                                    </svg>
+            <div className={`flex flex-col gap-4 px-4 flex-1 ${chatOpen ? 'lg:flex-row' : ''}`}>
+                <div className={`flex-1 ${chatOpen ? 'lg:max-w-[calc(100%-340px)]' : ''}`}>
+                    <div className="grid gap-4" style={{
+                        gridTemplateColumns: `repeat(auto-fit, minmax(300px, 1fr))`
+                    }}>
+                        <div className="relative">
+                            <h2 className="text-base font-normal mb-2">Local stream</h2>
+                            <div className="relative w-full bg-black rounded-lg aspect-video">
+                                <video
+                                    ref={localVideoRef}
+                                    autoPlay
+                                    playsInline
+                                    muted
+                                    className="w-full h-full bg-black rounded-lg object-cover"
+                                />
+                                <span
+                                    className="absolute bottom-2 right-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">
+                                    You
                                 </span>
                             </div>
-                        )}
+                        </div>
+                        {Array.from(remoteParticipants.values()).map((participant) => (
+                            <div key={participant.sessionId} className="relative">
+                                <h2 className="text-base font-normal mb-2">Remote stream</h2>
+                                <div className="relative w-full bg-black rounded-lg aspect-video">
+                                    <video
+                                        ref={participant.videoRef}
+                                        autoPlay
+                                        playsInline
+                                        className="w-full h-full rounded-lg object-cover"
+                                    />
+                                    <span
+                                        className="absolute bottom-2 right-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">
+                                        {participant.displayName}
+                                    </span>
+                                    {participant.muted && (
+                                        <div
+                                            className="absolute inset-0 flex items-center justify-center bg-black/40 rounded-lg pointer-events-none"
+                                            aria-hidden
+                                        >
+                                            <span className="rounded-full bg-red-500/90 p-2" title="Remote muted">
+                                                <svg className="w-6 h-6 text-white" fill="currentColor" viewBox="0 0 24 24"
+                                                     aria-hidden>
+                                                    <path
+                                                        d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.2 14.47 16 12 16s-4.52-1.8-4.93-4.15c-.08-.49-.49-.85-.98-.85-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V20c0 .55.45 1 1 1s1-.45 1-1v-2.08c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/>
+                                                </svg>
+                                            </span>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        ))}
                     </div>
                 </div>
                 {chatOpen && (
