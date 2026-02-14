@@ -8,8 +8,8 @@ import sfuApiService from '../services/sfuApiService';
 
 const API_BASE = API_CONFIG.BASE_URL;
 const AUTH_BASE = API_CONFIG.BASE_URL_AUTH;
-// const ROOM_ID = '0GYwPJut';
-const ROOM_ID = 'liuVr5EO';
+const ROOM_ID = '0GYwPJut';
+// const ROOM_ID = 'liuVr5EO';
 const STORAGE_KEY = API_CONFIG.STORAGE_TOKEN_KEY;
 const MUTE_DATA_CHANNEL_NAME = 'mute-signal';
 const CHAT_DATA_CHANNEL_NAME = 'chat';
@@ -331,56 +331,46 @@ export default function VideoCall() {
     }
 
     /**
-     * Publishes mute data channel to SFU.
-     * Steps: publishDataChannels API → create negotiated DC → onopen send current mute state.
+     * Publishes all data channels (mute + chat) to SFU in one API call.
+     * Uses array in request; iterates response to create each negotiated DC and wire handlers.
      */
-    async function establishAndPublishMuteDataChannel(
+    async function establishAndPublishDataChannels(
         pc: RTCPeerConnection,
         sessionId: string
     ) {
         const response = await sfuApiService.publishDataChannels(sessionId, {
-            dataChannels: [{location: 'local', dataChannelName: MUTE_DATA_CHANNEL_NAME}],
+            dataChannels: [
+                {location: 'local', dataChannelName: MUTE_DATA_CHANNEL_NAME},
+                {location: 'local', dataChannelName: CHAT_DATA_CHANNEL_NAME},
+            ],
         });
-        const channelId = response.data?.dataChannels?.[0]?.id;
-        if (channelId == null) throw new Error('No data channel ID returned');
-        const dc = pc.createDataChannel(MUTE_DATA_CHANNEL_NAME, {
-            negotiated: true,
-            id: channelId,
-        });
-        muteDataChannelRef.current = dc;
-        dc.onopen = () => {
-            try {
-                dc.send(JSON.stringify({muted: mutedRef.current}));
-            } catch (_) {
+        const channels = response.data?.dataChannels ?? [];
+        for (const info of channels) {
+            const channelId = info.id;
+            const name = info.dataChannelName;
+            if (channelId == null) continue;
+            const dc = pc.createDataChannel(name, {
+                negotiated: true,
+                id: channelId,
+            });
+            if (name === MUTE_DATA_CHANNEL_NAME) {
+                muteDataChannelRef.current = dc;
+                dc.onopen = () => {
+                    try {
+                        dc.send(JSON.stringify({muted: mutedRef.current}));
+                    } catch (_) {}
+                };
+            } else if (name === CHAT_DATA_CHANNEL_NAME) {
+                chatDataChannelRef.current = dc;
+                dc.onopen = () => {
+                    if (joinNotificationReadyRef.current) {
+                        sendJoinNotificationWhenReady();
+                    } else {
+                        chatDcOpenBeforeReadyRef.current = true;
+                    }
+                };
             }
-        };
-    }
-
-    /**
-     * Publishes chat data channel to SFU.
-     * Steps: publishDataChannels API → create negotiated DC → onopen send join notification if ready.
-     */
-    async function establishAndPublishChatDataChannel(
-        pc: RTCPeerConnection,
-        sessionId: string
-    ) {
-        const response = await sfuApiService.publishDataChannels(sessionId, {
-            dataChannels: [{location: 'local', dataChannelName: CHAT_DATA_CHANNEL_NAME}],
-        });
-        const channelId = response.data?.dataChannels?.[0]?.id;
-        if (channelId == null) throw new Error('No chat data channel ID returned');
-        const dc = pc.createDataChannel(CHAT_DATA_CHANNEL_NAME, {
-            negotiated: true,
-            id: channelId,
-        });
-        chatDataChannelRef.current = dc;
-        dc.onopen = () => {
-            if (joinNotificationReadyRef.current) {
-                sendJoinNotificationWhenReady();
-            } else {
-                chatDcOpenBeforeReadyRef.current = true;
-            }
-        };
+        }
     }
 
     /**
@@ -693,38 +683,13 @@ export default function VideoCall() {
             console.warn(`Video element not available for participant ${otherSessionId}`);
         }
 
-        const muteDcResponse = await sfuApiService.subscribeDataChannels(mySessionId, {
+        const dcResponse = await sfuApiService.subscribeDataChannels(mySessionId, {
             dataChannels: [
                 {
                     location: 'remote',
                     sessionId: otherSessionId,
                     dataChannelName: MUTE_DATA_CHANNEL_NAME,
                 },
-            ],
-        });
-        const muteChannelId = muteDcResponse.data?.dataChannels?.[0]?.id;
-        if (muteChannelId != null) {
-            const muteDc = remotePeerConnection.createDataChannel(`${MUTE_DATA_CHANNEL_NAME}-subscribed`, {
-                negotiated: true,
-                id: muteChannelId,
-            });
-            muteDc.onmessage = (ev: MessageEvent) => {
-                try {
-                    const {muted} = JSON.parse(ev.data as string) as { muted?: boolean };
-                    if (typeof muted === 'boolean') {
-                        const participant = remoteParticipantsRef.current.get(otherSessionId);
-                        if (participant) {
-                            participant.muted = muted;
-                            setRemoteParticipants(new Map(remoteParticipantsRef.current));
-                        }
-                    }
-                } catch (_) {
-                }
-            };
-        }
-
-        const chatDcResponse = await sfuApiService.subscribeDataChannels(mySessionId, {
-            dataChannels: [
                 {
                     location: 'remote',
                     sessionId: otherSessionId,
@@ -732,43 +697,60 @@ export default function VideoCall() {
                 },
             ],
         });
-        const chatChannelId = chatDcResponse.data?.dataChannels?.[0]?.id;
-        if (chatChannelId != null) {
-            const chatDc = remotePeerConnection.createDataChannel(`${CHAT_DATA_CHANNEL_NAME}-subscribed`, {
+        const channels = dcResponse.data?.dataChannels ?? [];
+        for (const info of channels) {
+            const channelId = info.id;
+            const name = info.dataChannelName;
+            if (channelId == null) continue;
+            const dc = remotePeerConnection.createDataChannel(`${name}-subscribed`, {
                 negotiated: true,
-                id: chatChannelId,
+                id: channelId,
             });
-            chatDc.onmessage = (ev: MessageEvent) => {
-                try {
-                    const data = JSON.parse(ev.data as string) as {
-                        type?: string;
-                        text?: string;
-                        event?: 'join' | 'leave';
-                        timestamp?: number;
-                        displayName?: string;
-                    };
-                    if (data.type === 'chat' && data.text) {
-                        setChatMessages((prev) => [
-                            ...prev,
-                            {
-                                id: `msg-${data.timestamp || Date.now()}-${Math.random()}`,
-                                text: data.text!,
-                                sender: 'other',
-                                timestamp: data.timestamp || Date.now(),
-                            },
-                        ]);
-                    } else if (data.type === 'notification' && data.event) {
-                        if (data.event === 'join') {
-                            const msg = data.displayName ? `${data.displayName} joined the call` : 'User joined the call';
-                            showNotification(msg, 'join');
-                        } else if (data.event === 'leave') {
-                            const msg = data.displayName ? `${data.displayName} left the call` : 'User left the call';
-                            showNotification(msg, 'leave');
+            if (name === MUTE_DATA_CHANNEL_NAME) {
+                dc.onmessage = (ev: MessageEvent) => {
+                    try {
+                        const {muted} = JSON.parse(ev.data as string) as { muted?: boolean };
+                        if (typeof muted === 'boolean') {
+                            const participant = remoteParticipantsRef.current.get(otherSessionId);
+                            if (participant) {
+                                participant.muted = muted;
+                                setRemoteParticipants(new Map(remoteParticipantsRef.current));
+                            }
                         }
-                    }
-                } catch (_) {
-                }
-            };
+                    } catch (_) {}
+                };
+            } else if (name === CHAT_DATA_CHANNEL_NAME) {
+                dc.onmessage = (ev: MessageEvent) => {
+                    try {
+                        const data = JSON.parse(ev.data as string) as {
+                            type?: string;
+                            text?: string;
+                            event?: 'join' | 'leave';
+                            timestamp?: number;
+                            displayName?: string;
+                        };
+                        if (data.type === 'chat' && data.text) {
+                            setChatMessages((prev) => [
+                                ...prev,
+                                {
+                                    id: `msg-${data.timestamp || Date.now()}-${Math.random()}`,
+                                    text: data.text!,
+                                    sender: 'other',
+                                    timestamp: data.timestamp || Date.now(),
+                                },
+                            ]);
+                        } else if (data.type === 'notification' && data.event) {
+                            if (data.event === 'join') {
+                                const msg = data.displayName ? `${data.displayName} joined the call` : 'User joined the call';
+                                showNotification(msg, 'join');
+                            } else if (data.event === 'leave') {
+                                const msg = data.displayName ? `${data.displayName} left the call` : 'User left the call';
+                                showNotification(msg, 'leave');
+                            }
+                        }
+                    } catch (_) {}
+                };
+            }
         }
 
     }
@@ -899,15 +881,10 @@ export default function VideoCall() {
             );
             await connected;
 
-            await establishAndPublishMuteDataChannel(
+            await establishAndPublishDataChannels(
                 localPeerConnection,
                 mySessionId
-            ).catch((e) => console.warn('Mute data channel setup:', e));
-
-            await establishAndPublishChatDataChannel(
-                localPeerConnection,
-                mySessionId
-            ).catch((e) => console.warn('Chat data channel setup:', e));
+            ).catch((e) => console.warn('Data channels setup:', e));
 
             joinNotificationReadyRef.current = true;
             if (chatDcOpenBeforeReadyRef.current) {
