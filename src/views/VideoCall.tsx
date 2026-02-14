@@ -8,8 +8,6 @@ import sfuApiService from '../services/sfuApiService';
 
 const API_BASE = API_CONFIG.BASE_URL;
 const AUTH_BASE = API_CONFIG.BASE_URL_AUTH;
-const ROOM_ID = '0GYwPJut';
-// const ROOM_ID = 'liuVr5EO';
 const STORAGE_KEY = API_CONFIG.STORAGE_TOKEN_KEY;
 const MUTE_DATA_CHANNEL_NAME = 'mute-signal';
 const CHAT_DATA_CHANNEL_NAME = 'chat';
@@ -63,19 +61,17 @@ async function signIn(username: string, password: string): Promise<string> {
 
 /**
  * Joins room and creates SFU session.
- * Steps: POST /rooms/:id/join → return sessionId.
+ * mediaConstraints: user-selected { video: boolean, audio: boolean }.
  */
 async function createCallsSession(
     token: string,
-    withMedia: boolean
+    roomToken: string,
+    mediaConstraints: { video: boolean; audio: boolean }
 ): Promise<string> {
-
-    const res = await fetch(`${API_BASE}/rooms/${ROOM_ID}/join`, {
+    const res = await fetch(`${API_BASE}/rooms/${roomToken}/join`, {
         method: 'POST',
         headers: getHeader(token),
-        body: JSON.stringify({
-            mediaConstraints: {video: withMedia, audio: withMedia},
-        }),
+        body: JSON.stringify({ mediaConstraints }),
     }).then((r) => r.json());
     return res.data.sessionId;
 }
@@ -127,7 +123,11 @@ export default function VideoCall() {
 
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
+    const [roomToken, setRoomToken] = useState('0GYwPJut');
+    const [joinWithVideo, setJoinWithVideo] = useState(true);
+    const [joinWithAudio, setJoinWithAudio] = useState(true);
     const [muted, setMuted] = useState(false);
+    const [videoMuted, setVideoMuted] = useState(false);
     const [chatOpen, setChatOpen] = useState(false);
     const [chatMessages, setChatMessages] = useState<Array<{
         id: string;
@@ -145,6 +145,36 @@ export default function VideoCall() {
     const [remoteParticipants, setRemoteParticipants] = useState<Map<string, RemoteParticipant>>(new Map());
     const joinNotificationReadyRef = useRef(false);
     const chatDcOpenBeforeReadyRef = useRef(false);
+    const preJoinStreamRef = useRef<MediaStream | null>(null);
+    const roomTokenRef = useRef<string>('');
+    const streamHandedOffToCallRef = useRef(false);
+
+    /** In-call: attach local stream to video element (new element mounts when switching views). */
+    useEffect(() => {
+        if (inCall && localVideoRef.current && localStreamRef.current) {
+            localVideoRef.current.srcObject = localStreamRef.current;
+        }
+    }, [inCall]);
+
+    /** Pre-join: get user media for preview when logged in and not yet in call. */
+    useEffect(() => {
+        if (!token || inCall) return;
+        streamHandedOffToCallRef.current = false;
+        let stream: MediaStream | null = null;
+        navigator.mediaDevices.getUserMedia({ audio: true, video: true })
+            .then((s) => {
+                stream = s;
+                preJoinStreamRef.current = s;
+                if (localVideoRef.current) localVideoRef.current.srcObject = s;
+            })
+            .catch((e) => console.warn('Pre-join media:', e));
+        return () => {
+            if (streamHandedOffToCallRef.current) return;
+            stream?.getTracks().forEach((t) => t.stop());
+            preJoinStreamRef.current = null;
+            if (localVideoRef.current) localVideoRef.current.srcObject = null;
+        };
+    }, [token, inCall]);
 
     /**
      * Handles login form submit.
@@ -208,6 +238,62 @@ export default function VideoCall() {
         subscriptionQueueRef.current = [];
         isProcessingQueueRef.current = false;
         setRemoteParticipants(new Map());
+    }
+
+    /**
+     * Pre-join: toggles camera on/off. Stops the track when off (camera light goes off).
+     */
+    async function handlePreJoinCameraToggle() {
+        const stream = preJoinStreamRef.current || localStreamRef.current;
+        if (!stream) return;
+        const videoTrack = stream.getVideoTracks()[0];
+        if (joinWithVideo && videoTrack) {
+            videoTrack.stop();
+            stream.removeTrack(videoTrack);
+            setJoinWithVideo(false);
+        } else if (!joinWithVideo) {
+            try {
+                const newStream = await navigator.mediaDevices.getUserMedia({ video: true });
+                const newTrack = newStream.getVideoTracks()[0];
+                stream.addTrack(newTrack);
+                setJoinWithVideo(true);
+            } catch (e) {
+                console.warn('Could not turn camera on:', e);
+            }
+        }
+    }
+
+    /**
+     * In-call: toggles local video (camera on/off).
+     * When turning off: stops the video track to turn off the camera (camera light goes off).
+     * When turning on: gets a new video track and replaces it in the stream and peer connection.
+     */
+    async function handleVideoMute() {
+        const stream = localStreamRef.current;
+        const pc = peerConnectionRef.current;
+        if (!stream || !pc) return;
+        const videoTrack = stream.getVideoTracks()[0];
+        if (videoMuted) {
+            // Turn camera ON: get new track, replace in stream and peer connection
+            try {
+                const newStream = await navigator.mediaDevices.getUserMedia({ video: true });
+                const newTrack = newStream.getVideoTracks()[0];
+                if (videoTrack) stream.removeTrack(videoTrack);
+                stream.addTrack(newTrack);
+                const videoSender = pc.getSenders().find((s) => s.track?.kind === 'video');
+                if (videoSender) await videoSender.replaceTrack(newTrack);
+                setVideoMuted(false);
+            } catch (e) {
+                console.warn('Could not turn camera on:', e);
+            }
+        } else if (videoTrack) {
+            // Turn camera OFF: stop the track (turns off camera hardware, light goes off)
+            videoTrack.stop();
+            const videoSender = pc.getSenders().find((s) => s.track?.kind === 'video');
+            if (videoSender) await videoSender.replaceTrack(null);
+            stream.removeTrack(videoTrack);
+            setVideoMuted(true);
+        }
     }
 
     /**
@@ -281,7 +367,7 @@ export default function VideoCall() {
         sendNotificationEvent('leave');
         doLeaveCleanup();
         try {
-            await sfuApiService.leaveRoom(ROOM_ID);
+            await sfuApiService.leaveRoom(roomTokenRef.current);
         } catch (e) {
             console.warn('Leave room:', e);
         }
@@ -292,6 +378,7 @@ export default function VideoCall() {
      * Steps: Close WebSocket → clear refs → close peer connection → stop tracks → reset state.
      */
     function doLeaveCleanup() {
+        streamHandedOffToCallRef.current = false;
         if (roomWsRef.current) {
             roomWsRef.current.close();
             roomWsRef.current = null;
@@ -330,6 +417,7 @@ export default function VideoCall() {
         setRemoteParticipants(new Map());
         setInCall(false);
         setMuted(false);
+        setVideoMuted(false);
         muteDataChannelRef.current = null;
         chatDataChannelRef.current = null;
         setChatMessages([]);
@@ -435,8 +523,6 @@ export default function VideoCall() {
         const userToken = getStoredToken();
         // const wsUrl = API_CONFIG.WS_ROOM_URL + `?token=${userToken}`;
         const wsUrl = `wss://test-service.sharenest.io/ws/room?token=${userToken}`;
-        console.log("----------------------------")
-        console.log(wsUrl)
         if (!wsUrl) {
             console.warn('WS_ROOM_URL not configured');
             return;
@@ -447,12 +533,12 @@ export default function VideoCall() {
 
         ws.onopen = () => {
             const mySessionId = mySessionIdRef.current;
-            const videoTrack = localStreamRef.current?.getVideoTracks()[0]?.id ?? '';
-            const audioTrack = localStreamRef.current?.getAudioTracks()[0]?.id ?? '';
-            console.log(username)
+            const stream = localStreamRef.current;
+            const videoTrack = stream?.getVideoTracks()[0]?.id ?? '';
+            const audioTrack = stream?.getAudioTracks()[0]?.id ?? '';
             ws.send(JSON.stringify({
                 type: 'JOIN_ROOM',
-                roomToken: ROOM_ID,
+                roomToken: roomTokenRef.current,
                 userId: mySessionId,
                 userName: username || 'User',
                 sessionId: mySessionId,
@@ -473,8 +559,6 @@ export default function VideoCall() {
                     audioTrack?: string;
                     dataChannel?: string;
                 };
-                console.log(data)
-                console.log("----------")
                 if (data.type === 'USER_JOINED' && data.sessionId && data.sessionId !== mySessionIdRef.current) {
                     if (subscribedSessionIdsRef.current.has(data.sessionId)) return;
                     subscribedSessionIdsRef.current.add(data.sessionId);
@@ -772,13 +856,8 @@ export default function VideoCall() {
 
     /**
      * Joins the call.
-     * Steps:
-     * 1. getUserMedia (audio, video)
-     * 2. createCallsSession (join room)
-     * 3. Create peer connection, add transceivers
-     * 4. Publish tracks to SFU, wait for ICE connected
-     * 5. Publish mute and chat data channels
-     * 6. Connect room WebSocket (sends JOIN_ROOM, receives USER_JOINED/USER_LEFT)
+     * Uses user-selected mediaConstraints (joinWithVideo, joinWithAudio).
+     * Publishes only the tracks user selected.
      */
     async function handleJoinCall() {
         const userToken = getStoredToken();
@@ -786,22 +865,28 @@ export default function VideoCall() {
             setError('Not logged in');
             return;
         }
+        if (!roomToken.trim()) {
+            setError('Enter a room code');
+            return;
+        }
+        roomTokenRef.current = roomToken.trim();
 
         const localVideo = localVideoRef.current;
         if (!localVideo) return;
 
+        const mediaConstraints = { video: joinWithVideo, audio: joinWithAudio };
         setError(null);
         setLoading(true);
 
         try {
-            const media = await navigator.mediaDevices.getUserMedia({
-                audio: true,
-                video: true,
-            });
+            let media = preJoinStreamRef.current;
+            if (!media) {
+                media = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+            }
             localStreamRef.current = media;
             localVideo.srcObject = media;
 
-            const mySessionId = await createCallsSession(userToken, true);
+            const mySessionId = await createCallsSession(userToken, roomTokenRef.current, mediaConstraints);
             mySessionIdRef.current = mySessionId;
 
             const localPeerConnection = createPeerConnection();
@@ -849,8 +934,11 @@ export default function VideoCall() {
                 }
             };
 
-            const transceivers = media.getTracks().map((track) =>
-                localPeerConnection.addTransceiver(track, {direction: 'sendonly'})
+            const tracksToPublish = media.getTracks().filter((t) =>
+                (t.kind === 'audio' && joinWithAudio) || (t.kind === 'video' && joinWithVideo)
+            );
+            const transceivers = tracksToPublish.map((track) =>
+                localPeerConnection.addTransceiver(track, { direction: 'sendonly' })
             );
 
             const localOffer = await localPeerConnection.createOffer();
@@ -906,6 +994,10 @@ export default function VideoCall() {
                 await sendJoinNotificationWhenReady();
             }
 
+            setMuted(!joinWithAudio);
+            mutedRef.current = !joinWithAudio;
+            setVideoMuted(!joinWithVideo);
+            streamHandedOffToCallRef.current = true;
             setInCall(true);
 
             connectRoomWebSocket();
@@ -988,37 +1080,127 @@ export default function VideoCall() {
                     </div>
                 ))}
             </div>
-            <div className="flex justify-between items-center px-4 py-3 shrink-0">
+            <div className="flex justify-between items-center gap-3 px-4 py-3 shrink-0 border-b border-white/10">
                 <h1 className="text-xl font-normal">Video Call</h1>
-                <button
-                    type="button"
-                    onClick={handleLogout}
-                    className="text-red-500 hover:text-red-400 text-sm font-medium transition-colors"
-                >
-                    Logout
-                </button>
+                <div className="flex items-center gap-2">
+                    {!inCall && (
+                        <input
+                            id="room-token"
+                            type="text"
+                            value={roomToken}
+                            onChange={(e) => setRoomToken(e.target.value)}
+                            placeholder="Enter room code"
+                            className="w-40 sm:w-52 min-w-[140px] bg-white border-2 border-gray-300 rounded-lg px-4 py-2 text-base text-gray-900 placeholder-gray-500 focus:outline-none focus:border-green-500 focus:ring-2 focus:ring-green-500/30 shadow-md"
+                        />
+                    )}
+                    <button
+                        type="button"
+                        onClick={handleLogout}
+                        className="text-red-500 hover:text-red-400 text-sm font-medium transition-colors shrink-0"
+                    >
+                        Logout
+                    </button>
+                </div>
             </div>
-            <div className={`flex flex-col gap-4 px-4 flex-1 ${chatOpen ? 'lg:flex-row' : ''}`}>
-                <div className={`flex-1 ${chatOpen ? 'lg:max-w-[calc(100%-340px)]' : ''}`}>
-                    <div className="grid gap-4" style={{
-                        gridTemplateColumns: `repeat(auto-fit, minmax(300px, 1fr))`
-                    }}>
-                        <div className="relative">
-                            <h2 className="text-base font-normal mb-2">Local stream</h2>
-                            <div className="relative w-full bg-black rounded-lg aspect-video">
-                                <video
-                                    ref={localVideoRef}
-                                    autoPlay
-                                    playsInline
-                                    muted
-                                    className="w-full h-full bg-black rounded-lg object-cover"
-                                />
-                                <span
-                                    className="absolute bottom-2 right-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">
-                                    You
-                                </span>
-                            </div>
+
+            {!inCall ? (
+                <div className="flex-1 flex flex-col items-center justify-center px-4 gap-6 max-w-md mx-auto w-full">
+                    <div className="w-full relative">
+                        <div className="relative w-full bg-black rounded-xl aspect-video overflow-hidden">
+                            <video
+                                ref={localVideoRef}
+                                autoPlay
+                                playsInline
+                                muted
+                                className="w-full h-full object-cover"
+                            />
+                            {!joinWithVideo && (
+                                <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
+                                    <span className="rounded-full bg-gray-700 p-4">
+                                        <svg className="w-10 h-10 text-white/60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                                        </svg>
+                                    </span>
+                                </div>
+                            )}
+                            <span className="absolute bottom-2 left-2 px-2 py-1 rounded text-xs font-medium bg-black/60 text-white">You</span>
                         </div>
+                        <div className="flex justify-center gap-3 mt-3">
+                            <button
+                                type="button"
+                                onClick={() => setJoinWithAudio(!joinWithAudio)}
+                                className={`flex items-center gap-2 rounded-full px-4 py-2.5 text-sm font-medium transition-colors ${
+                                    joinWithAudio
+                                        ? 'bg-white/10 border border-white/20 hover:bg-white/15'
+                                        : 'bg-red-500/20 border border-red-400/50 text-red-400'
+                                }`}
+                                title={joinWithAudio ? 'Mic on' : 'Mic off'}
+                            >
+                                {joinWithAudio ? (
+                                    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/>
+                                    </svg>
+                                ) : (
+                                    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/>
+                                    </svg>
+                                )}
+                                {joinWithAudio ? 'Microphone' : 'Mic off'}
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handlePreJoinCameraToggle}
+                                className={`flex items-center gap-2 rounded-full px-4 py-2.5 text-sm font-medium transition-colors ${
+                                    joinWithVideo
+                                        ? 'bg-white/10 border border-white/20 hover:bg-white/15'
+                                        : 'bg-red-500/20 border border-red-400/50 text-red-400'
+                                }`}
+                                title={joinWithVideo ? 'Camera on' : 'Camera off'}
+                            >
+                                {joinWithVideo ? (
+                                    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M18 10.48V6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2v-4.48l4 3.98v-11l-4 3.98zm-2-.79V18H4V6h12v3.69z"/>
+                                    </svg>
+                                ) : (
+                                    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M21 6.5l-4 4V7c0-.55-.45-1-1-1H9.82L21 17.18V6.5zM3.27 2L2 3.27 4.73 6H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.21 0 .39-.08.54-.18L19.73 21 21 19.73 3.27 2z"/>
+                                    </svg>
+                                )}
+                                {joinWithVideo ? 'Camera' : 'Camera off'}
+                            </button>
+                        </div>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={handleJoinCall}
+                        disabled={loading || !roomToken.trim()}
+                        className="w-full rounded-full px-6 py-3 text-base font-medium bg-green-600 text-white hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
+                    >
+                        {loading ? (
+                            <>
+                                <svg className="animate-spin h-5 w-5" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"/>
+                                </svg>
+                                Joining…
+                            </>
+                        ) : (
+                            <>
+                                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
+                                </svg>
+                                Join now
+                            </>
+                        )}
+                    </button>
+                    {error && <p className="text-red-400 text-sm">{error}</p>}
+                </div>
+            ) : (
+            <div className="flex-1 flex relative overflow-hidden">
+                <div className={`flex-1 flex flex-col transition-all duration-300 ${chatOpen ? 'mr-0' : ''}`}>
+                    <div className="flex-1 grid gap-4 p-4 relative" style={{
+                        gridTemplateColumns: `repeat(auto-fit, minmax(280px, 1fr))`
+                    }}>
                         {Array.from(remoteParticipants.values()).map((participant) => (
                             <div key={participant.sessionId} className="relative">
                                 <h2 className="text-base font-normal mb-2">Remote stream</h2>
@@ -1050,10 +1232,29 @@ export default function VideoCall() {
                                 </div>
                             </div>
                         ))}
+                        <div className="absolute bottom-4 left-4 z-30 w-40 h-28 sm:w-48 sm:h-32 rounded-lg overflow-hidden border-2 border-white/30 shadow-xl bg-black">
+                            <video
+                                ref={localVideoRef}
+                                autoPlay
+                                playsInline
+                                muted
+                                className="w-full h-full object-cover"
+                            />
+                            {(!joinWithVideo || videoMuted) && (
+                                <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
+                                    <span className="rounded-full bg-gray-700 p-2">
+                                        <svg className="w-6 h-6 text-white/60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                                        </svg>
+                                    </span>
+                                </div>
+                            )}
+                            <span className="absolute bottom-1 left-1 px-1.5 py-0.5 rounded text-xs font-medium bg-black/60 text-white">You</span>
+                        </div>
                     </div>
                 </div>
                 {chatOpen && (
-                    <div className="max-lg:hidden flex flex-col bg-white/5 border border-white/10 rounded-lg h-[600px]">
+                    <div className="absolute top-0 right-0 w-80 sm:w-96 h-full flex flex-col bg-gray-900/95 border-l border-white/10 shadow-xl z-40">
                         <div className="flex items-center justify-between p-3 border-b border-white/10">
                             <h3 className="text-sm font-medium">Chat</h3>
                             <button
@@ -1123,9 +1324,10 @@ export default function VideoCall() {
                     </div>
                 )}
             </div>
-            {error && <p className="text-red-500 px-4 text-sm">{error}</p>}
-            {chatOpen && (
-                <div className="lg:hidden fixed inset-0 z-50 bg-black/90 flex flex-col">
+            )}
+            {inCall && chatOpen && (
+                <div className="lg:hidden fixed inset-0 z-50 bg-black/60 flex justify-end" onClick={() => setChatOpen(false)}>
+                    <div className="w-full max-w-sm flex flex-col bg-gray-900 shadow-xl" onClick={(e) => e.stopPropagation()}>
                     <div className="flex items-center justify-between p-4 border-b border-white/10">
                         <h3 className="text-lg font-medium">Chat</h3>
                         <button
@@ -1192,42 +1394,59 @@ export default function VideoCall() {
                             </button>
                         </form>
                     </div>
+                    </div>
                 </div>
             )}
             <div className="flex justify-center items-center gap-2 py-4 px-4 shrink-0">
-                {!inCall ? (
-                    <button
-                        type="button"
-                        onClick={handleJoinCall}
-                        disabled={loading}
-                        className="rounded-full px-4 py-2 text-sm font-medium bg-green-600 text-white border border-green-600 hover:bg-green-700 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-                    >
-                        {loading ? 'Joining…' : 'Join'}
-                    </button>
-                ) : (
+                {inCall && (
                     <>
                         <button
                             type="button"
                             onClick={handleMute}
-                            className={`rounded-full px-4 py-2 text-sm font-medium border transition-colors ${
+                            className={`rounded-full p-2.5 text-sm font-medium border transition-colors ${
                                 muted
                                     ? 'bg-red-500/20 border-red-400/50 text-red-400'
                                     : 'bg-white/5 border-white/10 hover:bg-white/10'
                             }`}
-                            title={muted ? 'Unmute' : 'Mute'}
+                            title={muted ? 'Unmute mic' : 'Mute mic'}
                         >
-                            {muted ? 'Unmute' : 'Mute'}
+                            {muted ? (
+                                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/></svg>
+                            ) : (
+                                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
+                            )}
                         </button>
+                        {joinWithVideo && (
+                        <button
+                            type="button"
+                            onClick={handleVideoMute}
+                            className={`rounded-full p-2.5 text-sm font-medium border transition-colors ${
+                                videoMuted
+                                    ? 'bg-red-500/20 border-red-400/50 text-red-400'
+                                    : 'bg-white/5 border-white/10 hover:bg-white/10'
+                            }`}
+                            title={videoMuted ? 'Turn camera on' : 'Turn camera off'}
+                        >
+                            {videoMuted ? (
+                                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M21 6.5l-4 4V7c0-.55-.45-1-1-1H9.82L21 17.18V6.5zM3.27 2L2 3.27 4.73 6H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.21 0 .39-.08.54-.18L19.73 21 21 19.73 3.27 2z"/></svg>
+                            ) : (
+                                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M18 10.48V6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2v-4.48l4 3.98v-11l-4 3.98zm-2-.79V18H4V6h12v3.69z"/></svg>
+                            )}
+                        </button>
+                        )}
                         <button
                             type="button"
                             onClick={() => setChatOpen(!chatOpen)}
-                            className={`rounded-full px-4 py-2 text-sm font-medium border transition-colors ${
+                            className={`rounded-full p-2.5 text-sm font-medium border transition-colors ${
                                 chatOpen
                                     ? 'bg-green-600/20 border-green-400/50 text-green-400'
                                     : 'bg-white/5 border-white/10 hover:bg-white/10'
                             }`}
+                            title="Chat"
                         >
-                            Chat
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+                            </svg>
                         </button>
                         <button
                             type="button"
