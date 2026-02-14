@@ -48,7 +48,7 @@ export interface PublishDataChannelsRequest {
 }
 
 export interface SubscribeTracksRequest {
-  sessionDescription: SessionDescription; // Required: Current user's SDP offer
+  // sessionDescription: SessionDescription; // Required: Current user's SDP offer
   tracks: Array<{
     location: 'remote';
     sessionId: string; // Other user's session ID

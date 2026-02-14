@@ -123,6 +123,7 @@ export default function VideoCall() {
         videoRef: React.RefObject<HTMLVideoElement>;
     }>>([]);
     const isProcessingQueueRef = useRef(false);
+    const subscriptionQueueDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
@@ -183,6 +184,10 @@ export default function VideoCall() {
         localStreamRef.current = null;
         muteDataChannelRef.current = null;
         chatDataChannelRef.current = null;
+        if (subscriptionQueueDebounceRef.current) {
+            clearTimeout(subscriptionQueueDebounceRef.current);
+            subscriptionQueueDebounceRef.current = null;
+        }
         setChatMessages([]);
         setChatInput('');
         const localVideo = localVideoRef.current;
@@ -318,6 +323,10 @@ export default function VideoCall() {
         remoteVideoRefsRef.current.clear();
         subscriptionQueueRef.current = [];
         isProcessingQueueRef.current = false;
+        if (subscriptionQueueDebounceRef.current) {
+            clearTimeout(subscriptionQueueDebounceRef.current);
+            subscriptionQueueDebounceRef.current = null;
+        }
         setRemoteParticipants(new Map());
         setInCall(false);
         setMuted(false);
@@ -464,6 +473,8 @@ export default function VideoCall() {
                     audioTrack?: string;
                     dataChannel?: string;
                 };
+                console.log(data)
+                console.log("----------")
                 if (data.type === 'USER_JOINED' && data.sessionId && data.sessionId !== mySessionIdRef.current) {
                     if (subscribedSessionIdsRef.current.has(data.sessionId)) return;
                     subscribedSessionIdsRef.current.add(data.sessionId);
@@ -494,8 +505,12 @@ export default function VideoCall() {
                         videoRef,
                     });
 
-                    // Process queue (will only start if not already processing)
-                    processSubscriptionQueue();
+                    // Debounce processing so multiple USER_JOINED in quick succession get batched into one API call
+                    if (subscriptionQueueDebounceRef.current) clearTimeout(subscriptionQueueDebounceRef.current);
+                    subscriptionQueueDebounceRef.current = setTimeout(() => {
+                        subscriptionQueueDebounceRef.current = null;
+                        processSubscriptionQueue();
+                    }, 50);
                 } else if (data.type === 'USER_LEFT') {
                     if (data.sessionId) {
                         subscribedSessionIdsRef.current.delete(data.sessionId);
@@ -552,83 +567,83 @@ export default function VideoCall() {
     }
 
     /**
-     * Processes the subscription queue one by one.
-     * Each user's flow: subscribe tracks → renegotiate if needed → subscribe data channels → next user
+     * Processes the subscription queue in batch.
+     * Drains all queued users at once, then one subscribeTracks + one subscribeDataChannels API call.
+     * When multiple USER_JOINED arrive at once, all are subscribed in a single round-trip.
      */
     async function processSubscriptionQueue() {
         if (isProcessingQueueRef.current) return;
         if (subscriptionQueueRef.current.length === 0) return;
 
         isProcessingQueueRef.current = true;
+        const batch = subscriptionQueueRef.current.splice(0, subscriptionQueueRef.current.length);
 
-        while (subscriptionQueueRef.current.length > 0) {
-            const nextUser = subscriptionQueueRef.current.shift();
-            if (!nextUser) break;
-
-            try {
-                await doRemoteUserFlow(
-                    nextUser.sessionId,
-                    nextUser.tracks,
-                    nextUser.videoRef
-                );
-            } catch (e) {
-                console.warn(`Subscribe to user ${nextUser.sessionId} failed:`, e);
-                // Clean up on error
-                subscribedSessionIdsRef.current.delete(nextUser.sessionId);
-                remoteParticipantsRef.current.delete(nextUser.sessionId);
-                remoteVideoRefsRef.current.delete(nextUser.sessionId);
-                setRemoteParticipants(new Map(remoteParticipantsRef.current));
+        try {
+            await doBatchRemoteUsersFlow(batch);
+        } catch (e) {
+            console.warn('Batch subscribe failed:', e);
+            for (const u of batch) {
+                subscribedSessionIdsRef.current.delete(u.sessionId);
+                remoteParticipantsRef.current.delete(u.sessionId);
+                remoteVideoRefsRef.current.delete(u.sessionId);
+            }
+            setRemoteParticipants(new Map(remoteParticipantsRef.current));
+        } finally {
+            isProcessingQueueRef.current = false;
+            // Process any users added while we were working (e.g. second USER_JOINED arrived during batch)
+            if (subscriptionQueueRef.current.length > 0) {
+                processSubscriptionQueue();
             }
         }
-
-        isProcessingQueueRef.current = false;
     }
 
     /**
-     * Subscribes to a remote user's tracks and data channels.
-     * Steps:
-     * 1. subscribeTracks API (audio, video)
-     * 2. Wait for track events or renegotiate
-     * 3. Attach tracks to remote video element
-     * 4. subscribeDataChannels for mute and chat
-     * 5. Set up onmessage handlers for mute state and chat/notifications
+     * Subscribes to multiple remote users in one API call each for tracks and data channels.
+     * Uses arrays: one subscribeTracks with all tracks, one subscribeDataChannels with all data channels.
+     * When multiple USER_JOINED arrive at once, response order matches request order.
      */
-    async function doRemoteUserFlow(
-        otherSessionId: string,
-        tracks: { audio?: string; video?: string },
-        remoteVideoRef: React.RefObject<HTMLVideoElement>
+    async function doBatchRemoteUsersFlow(
+        users: Array<{
+            sessionId: string;
+            displayName: string;
+            tracks: { audio?: string; video?: string };
+            videoRef: React.RefObject<HTMLVideoElement>;
+        }>
     ) {
-        const tracksToPull: Array<{
+        const tracksToPull: Array<{ location: 'remote'; sessionId: string; trackName: string }> = [];
+        const dataChannelsToSubscribe: Array<{
             location: 'remote';
             sessionId: string;
-            trackName: string;
+            dataChannelName: string;
         }> = [];
-        if (tracks.audio) {
-            tracksToPull.push({
-                location: 'remote',
-                sessionId: otherSessionId,
-                trackName: tracks.audio,
-            });
+
+        for (const u of users) {
+            if (u.tracks.audio) {
+                tracksToPull.push({ location: 'remote', sessionId: u.sessionId, trackName: u.tracks.audio });
+            }
+            if (u.tracks.video) {
+                tracksToPull.push({ location: 'remote', sessionId: u.sessionId, trackName: u.tracks.video });
+            }
+            dataChannelsToSubscribe.push(
+                { location: 'remote', sessionId: u.sessionId, dataChannelName: MUTE_DATA_CHANNEL_NAME },
+                { location: 'remote', sessionId: u.sessionId, dataChannelName: CHAT_DATA_CHANNEL_NAME }
+            );
         }
-        if (tracks.video) {
-            tracksToPull.push({
-                location: 'remote',
-                sessionId: otherSessionId,
-                trackName: tracks.video,
-            });
-        }
+
         if (tracksToPull.length === 0) return;
 
-        if (!peerConnectionRef.current || !mySessionIdRef.current) return;
         const remotePeerConnection = peerConnectionRef.current;
         const mySessionId = mySessionIdRef.current;
+        if (!remotePeerConnection || !mySessionId) return;
         remotePeerConnectionRef.current = remotePeerConnection;
 
         const localSdp = remotePeerConnection.localDescription;
         if (!localSdp) throw new Error('Peer connection has no local description');
+
+        // 1. Single subscribeTracks API with all users' tracks
         const pullResponse = await sfuApiService.subscribeTracks(mySessionId, {
             tracks: tracksToPull,
-            sessionDescription: {type: localSdp.type as 'offer' | 'answer', sdp: localSdp.sdp},
+            // sessionDescription: { type: localSdp.type as 'offer' | 'answer', sdp: localSdp.sdp },
         });
 
         const resolvingTracks = Promise.all(
@@ -665,43 +680,43 @@ export default function VideoCall() {
         }
 
         const pulledTracks = await resolvingTracks;
-        const remoteVideoStream = new MediaStream();
-        pulledTracks.forEach((t) => remoteVideoStream.addTrack(t));
+        const trackIndexToSessionId = tracksToPull.map((t) => t.sessionId);
+        const userMap = new Map(users.map((u) => [u.sessionId, u]));
 
-        // Wait for video element to be available (React may not have rendered it yet)
-        let videoElement = remoteVideoRef.current;
-        let attempts = 0;
-        while (!videoElement && attempts < 10) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-            videoElement = remoteVideoRef.current;
-            attempts++;
+        const streamsBySession = new Map<string, MediaStream>();
+        for (let i = 0; i < pulledTracks.length; i++) {
+            const sessionId = trackIndexToSessionId[i];
+            if (!streamsBySession.has(sessionId)) streamsBySession.set(sessionId, new MediaStream());
+            streamsBySession.get(sessionId)!.addTrack(pulledTracks[i]);
         }
 
-        if (videoElement) {
-            videoElement.srcObject = remoteVideoStream;
-        } else {
-            console.warn(`Video element not available for participant ${otherSessionId}`);
+        for (const [sessionId, stream] of streamsBySession) {
+            const u = userMap.get(sessionId);
+            if (!u) continue;
+            let videoElement = u.videoRef.current;
+            let attempts = 0;
+            while (!videoElement && attempts < 10) {
+                await new Promise((r) => setTimeout(r, 100));
+                videoElement = u.videoRef.current;
+                attempts++;
+            }
+            if (videoElement) videoElement.srcObject = stream;
+            else console.warn(`Video element not available for participant ${sessionId}`);
         }
 
+        // 2. Single subscribeDataChannels API with all users' data channels
         const dcResponse = await sfuApiService.subscribeDataChannels(mySessionId, {
-            dataChannels: [
-                {
-                    location: 'remote',
-                    sessionId: otherSessionId,
-                    dataChannelName: MUTE_DATA_CHANNEL_NAME,
-                },
-                {
-                    location: 'remote',
-                    sessionId: otherSessionId,
-                    dataChannelName: CHAT_DATA_CHANNEL_NAME,
-                },
-            ],
+            dataChannels: dataChannelsToSubscribe,
         });
         const channels = dcResponse.data?.dataChannels ?? [];
-        for (const info of channels) {
+        const dcIndexToMeta = dataChannelsToSubscribe.map((d) => ({ sessionId: d.sessionId, name: d.dataChannelName }));
+
+        for (let i = 0; i < channels.length; i++) {
+            const info = channels[i];
             const channelId = info.id;
-            const name = info.dataChannelName;
-            if (channelId == null) continue;
+            const meta = dcIndexToMeta[i];
+            if (channelId == null || !meta) continue;
+            const { sessionId: otherSessionId, name } = meta;
             const dc = remotePeerConnection.createDataChannel(`${name}-subscribed`, {
                 negotiated: true,
                 id: channelId,
@@ -795,7 +810,7 @@ export default function VideoCall() {
             /**
              * Handles incoming data channels (chat from remote subscribers).
              * Chat: handle chat messages and join/leave notifications.
-             * Note: Mute state is handled per-participant in doRemoteUserFlow.
+             * Note: Mute state is handled per-participant in doBatchRemoteUsersFlow.
              */
             localPeerConnection.ondatachannel = (e: RTCDataChannelEvent) => {
                 const ch = e.channel;
